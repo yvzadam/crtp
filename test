@@ -1,0 +1,235 @@
+Yetkili lab ortamındaysa aşağıdaki setlerle AD/DC üzerinde **gürültülü Nmap NSE taraması** yapabilirsin. Önce not: `192.68.39.143` public IP bloğu gibi duruyor; lab IP’in büyük ihtimalle `192.168.39.143` olabilir. Aşağıda senin verdiğin IP’yi değişkene koydum, gerekirse düzelt.
+
+```bash
+export DC=192.68.39.143
+mkdir -p scans/ad-$DC
+```
+
+## 1) AD/DC servis keşfi — gürültülü başlangıç
+
+```bash
+sudo nmap -Pn -n -sT -A -T5 --reason -vv \
+-p 53,88,135,139,389,445,464,593,636,3268,3269,3389,5985,5986 \
+$DC -oA scans/ad-$DC/01_ad_service_discovery
+```
+
+Bu; DNS, Kerberos, RPC, LDAP, SMB, LDAPS, Global Catalog, RDP ve WinRM gibi tipik Domain Controller servislerini kontrol eder.
+
+## 2) SMB güvenlik/zafiyet script seti
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p445 --reason -vv \
+--script "smb-os-discovery,smb-protocols,smb2-capabilities,smb-security-mode,smb2-security-mode,smb2-time,smb2-vuln-uptime,smb-vuln-ms17-010" \
+$DC -oA scans/ad-$DC/02_smb_security_checks
+```
+
+Bu sette özellikle şunlara bakarsın:
+
+| Script               | Ne kontrol eder?                          |
+| -------------------- | ----------------------------------------- |
+| `smb-os-discovery`   | Hostname, domain/workgroup, OS bilgisi    |
+| `smb-protocols`      | SMBv1/SMBv2/SMBv3 destek durumu           |
+| `smb-security-mode`  | SMB signing / auth bilgileri              |
+| `smb2-security-mode` | SMB2/SMB3 message signing durumu          |
+| `smb2-capabilities`  | SMB2 yetenekleri                          |
+| `smb2-vuln-uptime`   | Uptime bilgisinden bazı patch çıkarımları |
+| `smb-vuln-ms17-010`  | EternalBlue/MS17-010 kontrolü             |
+
+Nmap’in resmi script dokümanında `smb2-security-mode`, SMB2/SMB3 dialect’leri için message signing yapılandırmasını belirlemek üzere kullanılır; `smb-vuln-ms17-010` ise SMBv1 sunucunun MS17-010/EternalBlue’a açık olup olmadığını tespit etmeye çalışır. ([nmap.org][1])
+
+## 3) SMB enum seti — kullanıcı/domain/share bilgisi
+
+Anonim erişim veya zayıf yapılandırma varsa bilgi dökebilir:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p445 --reason -vv \
+--script "smb-enum-domains,smb-enum-groups,smb-enum-users,smb-enum-shares,smb-enum-sessions,smb-server-stats,smb-system-info" \
+$DC -oA scans/ad-$DC/03_smb_enum_no_creds
+```
+
+Bazı scriptler kimlik bilgisi olmadan sonuç vermeyebilir. Nmap script veritabanında `smb-enum-users`, `smb-enum-domains`, `smb-system-info` gibi scriptler discovery/auth/intrusive kategorilerinde geçer; yani lab dışında dikkatli kullanılmalı. ([GitHub][2])
+
+## 4) Kimlik bilgili SMB enum
+
+Elinde domain hesabı varsa daha iyi sonuç verir:
+
+```bash
+export DOMAIN="LAB"
+export USER="yavuz"
+export PASS='Password123!'
+```
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p445 --reason -vv \
+--script "smb-enum-domains,smb-enum-groups,smb-enum-users,smb-enum-shares,smb-os-discovery,smb-security-mode,smb2-security-mode" \
+--script-args "smbdomain=$DOMAIN,smbusername=$USER,smbpassword=$PASS" \
+$DC -oA scans/ad-$DC/04_smb_enum_with_creds
+```
+
+Burada bakacağın kritik şeyler:
+
+```text
+Message signing enabled but not required  → relay riskini artırabilir
+SMBv1 enabled                             → ciddi hardening problemi
+Anonymous readable shares                 → bilgi sızıntısı
+Guest/null session                        → yanlış yapılandırma
+```
+
+## 5) LDAP RootDSE ve LDAP enum
+
+Önce anonim LDAP bilgi veriyor mu diye bak:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p389,636,3268,3269 --reason -vv \
+--script "ldap-rootdse,ldap-search" \
+$DC -oA scans/ad-$DC/05_ldap_rootdse_anonymous
+```
+
+`ldap-rootdse`, LDAP RootDSE’den naming context / default naming context gibi temel dizin bilgilerini almaya çalışır; Nmap dokümanı `ldap-search` scriptinin base belirtilmezse RootDSE’den namingContexts/defaultNamingContexts bilgisini kullanabildiğini belirtir. ([nmap.org][3])
+
+Domain base belli olunca örnek:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p389 --reason -vv \
+--script ldap-search \
+--script-args 'ldap.base="DC=lab,DC=local",ldap.qfilter=users' \
+$DC -oA scans/ad-$DC/06_ldap_users_anonymous
+```
+
+Gruplar için:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p389 --reason -vv \
+--script ldap-search \
+--script-args 'ldap.base="DC=lab,DC=local",ldap.qfilter=groups' \
+$DC -oA scans/ad-$DC/07_ldap_groups_anonymous
+```
+
+## 6) Kerberos kontrolleri
+
+Kerberos servisini versiyon/servis olarak kontrol et:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p88,464 --reason -vv \
+-sV --version-all \
+$DC -oA scans/ad-$DC/08_kerberos_service_check
+```
+
+Kullanıcı listesiyle Kerberos user enum yapmak istersen:
+
+```bash
+cat > users.txt << 'EOF'
+administrator
+admin
+krbtgt
+guest
+test
+yavuz
+user1
+svc_backup
+svc_sql
+EOF
+```
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p88 --reason -vv \
+--script krb5-enum-users \
+--script-args "krb5-enum-users.realm='LAB.LOCAL',userdb=users.txt" \
+$DC -oA scans/ad-$DC/09_kerberos_user_enum
+```
+
+`krb5-enum-users`, Kerberos hata cevaplarını kullanarak geçerli kullanıcı adlarını ayırt etmeye çalışır; Nmap bunu “intrusive” kategoride listeler, yani lab/izinli ortam dışında kullanma. ([nmap.org][4])
+
+## 7) DNS / Zone Transfer kontrolü
+
+Domain adını biliyorsan:
+
+```bash
+export FQDN="lab.local"
+```
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p53 --reason -vv \
+--script "dns-zone-transfer,dns-nsid,dns-service-discovery" \
+--script-args "dns-zone-transfer.domain=$FQDN" \
+$DC -oA scans/ad-$DC/10_dns_checks
+```
+
+Zone transfer açıksa ciddi bilgi sızıntısıdır; hostlar, servis kayıtları, DC kayıtları, bazen iç sistem isimleri dökülebilir.
+
+## 8) LDAPS / TLS zayıflık kontrolü
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p636,3269 --reason -vv \
+--script "ssl-enum-ciphers,ssl-cert" \
+$DC -oA scans/ad-$DC/11_ldaps_tls_checks
+```
+
+Burada bakacağın şeyler:
+
+```text
+TLS 1.0 / TLS 1.1 açık mı?
+Zayıf cipher var mı?
+Sertifika CN/SAN doğru mu?
+Sertifika süresi geçmiş mi?
+```
+
+## 9) Genel vuln kategorisi — daha gürültülü
+
+Bu daha agresif/gürültülü olur:
+
+```bash
+sudo nmap -Pn -n -sT -A -T5 --reason -vv \
+-p 53,88,135,139,389,445,464,593,636,3268,3269,3389,5985,5986 \
+--script "default,vuln,safe,discovery" \
+$DC -oA scans/ad-$DC/12_ad_default_vuln_discovery
+```
+
+Nmap’in script veritabanında `ldap-rootdse` ve `ldap-search` gibi scriptler `discovery/safe`, `smb-vuln-ms17-010` ise `safe/vuln`, bazı eski SMB vuln scriptleri ise `dos/exploit/intrusive/vuln` kategorilerinde geçer; bu yüzden “vuln” kategorisini komple çalıştırmak lab dışında risklidir. ([GitHub][2])
+
+## 10) Sonuçları hızlı ayıkla
+
+Açık portlar:
+
+```bash
+grep -E "open|VULNERABLE|State: VULNERABLE|Message signing|SMBv1|Domain|forest|namingContexts" scans/ad-$DC/*.nmap
+```
+
+Sadece zafiyet bulguları:
+
+```bash
+grep -RiE "VULNERABLE|vulnerable|CVE|MS17|SMBv1|signing.*not required|anonymous|Anonymous|Guest" scans/ad-$DC/
+```
+
+## Benim önerdiğim sıra
+
+Şu sırayla git:
+
+```bash
+sudo nmap -Pn -n -sT -A -T5 --reason -vv \
+-p 53,88,135,139,389,445,464,593,636,3268,3269 \
+$DC -oA scans/ad-$DC/01_ad_service_discovery
+```
+
+Sonra:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p445 --reason -vv \
+--script "smb-os-discovery,smb-protocols,smb-security-mode,smb2-security-mode,smb2-capabilities,smb-vuln-ms17-010" \
+$DC -oA scans/ad-$DC/02_smb_security_checks
+```
+
+Sonra:
+
+```bash
+sudo nmap -Pn -n -sT -T5 -p389,636,3268,3269 --reason -vv \
+--script "ldap-rootdse,ldap-search" \
+$DC -oA scans/ad-$DC/05_ldap_rootdse_anonymous
+```
+
+Bunlardan sonra çıkan domain adı, SMB signing durumu, SMBv1 durumu, LDAP anonymous sonucu ve MS17-010 sonucu bize AD tarafındaki ilk zafiyet resmini verir.
+
+[1]: https://nmap.org/nsedoc/scripts/smb2-security-mode.html?utm_source=chatgpt.com "smb2-security-mode NSE script"
+[2]: https://github.com/nmap/nmap/blob/master/scripts/script.db?utm_source=chatgpt.com "nmap/scripts/script.db at master"
+[3]: https://nmap.org/nsedoc/scripts/ldap-rootdse.html?utm_source=chatgpt.com "ldap-rootdse NSE script"
+[4]: https://nmap.org/nsedoc/scripts/krb5-enum-users.html?utm_source=chatgpt.com "krb5-enum-users NSE script"
