@@ -1,0 +1,28 @@
+AD Enumeration
+BloodHound attack path analizi
+Local admin hunting
+Session hunting
+Credential dumping
+Pass-the-Hash
+Pass-the-Ticket
+Overpass-the-Hash
+Kerberoasting
+AS-REP Roasting
+Unconstrained Delegation abuse
+Constrained Delegation abuse
+RBCD abuse
+ACL abuse
+AdminSDHolder persistence
+DCSync
+Golden Ticket
+Silver Ticket
+Diamond Ticket
+Skeleton Key
+Custom SSP
+DSRM persistence
+Child-to-parent trust escalation
+Inter-forest trust abuse
+SQL Server link abuse
+AD CS ESC attacks
+AMSI / Script Block Logging / CLM bypass
+MDE / MDI detection-bypass mantığı
