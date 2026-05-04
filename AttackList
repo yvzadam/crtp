@@ -26,3 +26,102 @@ SQL Server link abuse
 AD CS ESC attacks
 AMSI / Script Block Logging / CLM bypass
 MDE / MDI detection-bypass mantığı
+
+
+
+Aşağıdaki listeyi **CRTP / yetkili lab** rotası olarak düşünebilirsin. Komut/PoC zinciri yerine; **atak tipi, amaç, önkoşul, etki ve savunma odağı** verdim.
+
+## 1. CRTP’de klasik Active Directory saldırı aileleri
+
+CRTP içeriği; AD enumeration, trust mapping, Kerberos tabanlı saldırılar, domain privilege escalation, SQL Server trust abuse, AD CS saldırıları, persistence, monitoring ve bypass konularını kapsıyor. ([Altered Security][1])
+
+| Aşama                  | Atak tipi                                                                       | Amaç                                             |
+| ---------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------ |
+| **Enumeration**        | User/group/computer/SPN/ACL/session/trust keşfi                                 | Attack path çıkarmak                             |
+| **Credential attacks** | Password spraying, AS-REP roasting, Kerberoasting                               | Zayıf parola veya servis hesabı yakalamak        |
+| **Kerberos abuse**     | Pass-the-ticket, overpass-the-hash, silver/golden/diamond ticket                | Erişim veya persistence                          |
+| **ACL abuse**          | GenericAll, GenericWrite, WriteDACL, WriteOwner, AddMember, ForceChangePassword | Hak kötüye kullanımıyla privilege escalation     |
+| **Delegation abuse**   | Unconstrained delegation, constrained delegation, RBCD                          | Makine/servis hesabı üzerinden yükselme          |
+| **Lateral movement**   | SMB, WinRM, WMI, RDP, PsExec tarzı erişim                                       | Yetkili makineler arasında ilerleme              |
+| **Credential access**  | LSASS, DPAPI, cached creds, browser/app secrets                                 | Yeni kimlik bilgileri elde etme                  |
+| **Domain dominance**   | DCSync, DCShadow, krbtgt abuse, AdminSDHolder                                   | Domain seviyesinde kalıcılık veya tam hakimiyet  |
+| **Trust abuse**        | Child-to-root, forest trust, SIDHistory, trust key abuse                        | Enterprise Admin seviyesine ilerleme             |
+| **AD CS abuse**        | ESC1–ESC16, certificate template misconfig, NTLM relay to AD CS                 | Sertifika ile kimlik taklidi / domain escalation |
+| **SCCM / MCM abuse**   | ConfigMgr misconfig, overprivileged site roles, client push abuse               | Enterprise yönetim altyapısından AD’ye yayılma   |
+| **SQL trust abuse**    | MSSQL links, impersonation, xp_cmdshell path’leri                               | Uygulama/veritabanı trust’larıyla pivot          |
+
+## 2. CRTP için pratik lab rotası
+
+Mantıklı öğrenme sırası şöyle olur:
+
+1. **Domain keşfi:** kullanıcılar, gruplar, bilgisayarlar, GPO’lar, SPN’ler, local admin ilişkileri, oturumlar, ACL’ler.
+2. **Credential fırsatları:** password spraying, AS-REP roasting, Kerberoasting. Kerberoasting; SPN’e sahip servis hesabı için alınan servis biletinin offline kırılmasını hedefler ve zayıf servis hesabı parolalarında etkilidir. ([MDPI][2])
+3. **Privilege escalation:** ACL abuse, grup üyeliği ekleme, parola sıfırlama hakkı, delegation abuse, RBCD.
+4. **Lateral movement:** elde edilen credential veya ticket ile workstation/server pivot.
+5. **Domain dominance:** DCSync hakkı, krbtgt, Golden/Silver/Diamond ticket, AdminSDHolder, GPO abuse.
+6. **Forest / trust saldırıları:** child domain DA’dan forest root’a, external/forest trust mapping.
+7. **AD CS:** template, enrollment agent, web enrollment, EKU/SAN misconfig, ESC zincirleri.
+8. **Detection & hardening:** hangi event’lerin oluştuğu, MDI/MDE/SIEM tarafında hangi davranışların yakalanacağı.
+
+## 3. 2024–2026 güncel AD saldırı başlıkları
+
+| Yıl / dönem   | Güncel başlık                                        | Neden önemli?                                                                                                                                                                                                                                                                                             | Savunma odağı                                                                             |
+| ------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| **2024**      | **AD CS ESC15 / EKUwu / CVE-2024-49019**             | AD CS’de certificate template ve application policy abuse ile privilege escalation gündeme geldi. NVD, CVE-2024-49019’u “Active Directory Certificate Services Elevation of Privilege” olarak listeliyor. ([NVD][3])                                                                                      | AD CS patch, template izinleri, v1 template review, enrollment rights, EKU kontrolü       |
+| **2024**      | **AD CS template abuse genişlemesi**                 | SpecterOps dokümantasyonu ESC15’i schema version 1 certificate templates üzerinde application policy injection ile EKU kısıtlarını aşma tekniği olarak açıklar. ([docs.specterops.io][4])                                                                                                                 | ESC1–ESC16 audit, Certipy/PSPKIAudit/Locksmith ile defensive review                       |
+| **2024**      | **LDAPNightmare: CVE-2024-49112 / CVE-2024-49113**   | Aralık 2024’te Windows LDAP için RCE ve DoS açıkları gündeme geldi; CVE-2024-49112, NVD’de Windows LDAP RCE olarak geçiyor. ([NVD][5])                                                                                                                                                                    | DC patch yönetimi, LDAP exposure azaltma, monitoring                                      |
+| **2024–2025** | **SCCM / Microsoft Configuration Manager abuse**     | SpecterOps’un Misconfiguration Manager projesi, ConfigMgr/SCCM’nin AD attack path’lerinde ayrı bir yüzey olduğunu vurguluyor; 2024’te proje 22 teknik içeriyordu. ([SpecterOps][6])                                                                                                                       | SCCM role minimization, site DB izinleri, client push, NAA, PXE, collection rights audit  |
+| **2025**      | **CVE-2025-33073: SMB / NTLM reflection**            | NVD, CVE-2025-33073’ü Windows SMB’de authenticated attacker’ın network üzerinden privilege escalation yapabilmesine yol açan improper access control olarak listeliyor; CISA KEV’e 20 Ekim 2025’te eklendiğini de gösteriyor. ([NVD][7])                                                                  | June 2025+ patch, SMB signing, NTLM azaltma, outbound SMB kontrolü                        |
+| **2025**      | **Ghost SPN + Kerberos reflection / CVE-2025-58726** | NVD, CVE-2025-58726’yı Windows SMB Server privilege escalation olarak listeliyor; Semperis, Ghost SPN’lerin Kerberos reflection yüzeyi oluşturabildiğini ve CVE-2025-33073 sonrası da risk doğurduğunu yazdı. ([NVD][8])                                                                                  | Ghost SPN temizliği, DNS/SPN hygiene, SMB signing, patch                                  |
+| **2025**      | **Coercion + relay hâlâ kritik**                     | NTLM relay, PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce benzeri coercion teknikleriyle hâlâ AD CS, LDAP, SMB, MSSQL gibi hedeflere bağlanabiliyor; Microsoft AD CS relay riskini özellikle Web Enrollment ve Certificate Enrollment Web Service kullanan ortamlarda vurguluyor. ([Microsoft Support][9]) | EPA, channel binding, SMB/LDAP signing, AD CS web enrollment kapatma veya sertleştirme    |
+| **2025–2026** | **Windows Server 2025 LDAP hardening**               | Microsoft, Windows Server 2025 tarafında yeni AD deployment’larda LDAP signing/sealing davranışlarını daha güvenli varsayılanlara taşıdığını ve LDAP signing/channel binding dokümantasyonunu güncellediğini belirtiyor. ([Microsoft Learn][10])                                                          | Legacy LDAP bağımlılıklarını audit etmek, unsigned bind kapatmak                          |
+| **2026**      | **NTLM phase-out hazırlığı**                         | Microsoft, Ocak 2026’da NTLM’i Kerberos tabanlı alternatifler lehine varsayılan olarak devre dışı bırakmaya yönelik aşamalı yol haritasını duyurdu. ([TECHCOMMUNITY.MICROSOFT.COM][11])                                                                                                                   | NTLM audit, Kerberos uyumluluk testi, IAKerb/Local KDC hazırlığı, relay yüzeyini küçültme |
+
+## 4. 2026’da lab’a eklemeni önerdiğim modern senaryolar
+
+**AD CS odaklı rota:**
+Low-privileged domain user → AD CS template enumeration → ESC misconfig tespiti → sertifika tabanlı kimlik taklidi → privilege escalation → detection/hardening.
+
+**NTLM relay / coercion savunma rotası:**
+Relay mümkün mü? SMB signing, LDAP signing, channel binding ve EPA açık mı? AD CS Web Enrollment kullanılıyor mu? Microsoft, AD CS Web Enrollment veya Certificate Enrollment Web Service kullanan ortamların NTLM relay açısından riskli olabileceğini belirtiyor. ([Microsoft Support][9])
+
+**SCCM rota:**
+ConfigMgr site rolleri, site database izinleri, client push, PXE, collections ve overprivileged admins. SpecterOps, 2025’te SCCM misconfiguration’larının hâlâ yaygın ve tehlikeli attack path’lere yol açtığını yazdı. ([SpecterOps][12])
+
+**Kerberos hygiene rota:**
+RC4 kullanan servis hesapları, SPN karmaşası, zayıf servis hesabı parolaları, gMSA kullanımı, delegation ve RBCD kontrolleri.
+
+**Trust rota:**
+Child domain → parent/root domain, SID filtering, selective authentication, external trust, forest trust, SQL links.
+
+## 5. Önceliklendirilmiş çalışma listesi
+
+CRTP için şu sırayla ilerlemeni öneririm:
+
+1. **BloodHound mantığı:** attack path okumayı öğren.
+2. **Kerberoasting / AS-REP roasting:** neden çalışır, hangi hesaplar risklidir, nasıl engellenir.
+3. **ACL abuse:** GenericAll, WriteDACL, WriteOwner, AddMember, ForceChangePassword.
+4. **Delegation:** unconstrained, constrained, RBCD.
+5. **AD CS:** önce ESC1–ESC8, sonra ESC9–ESC16 ve özellikle ESC15.
+6. **DCSync / persistence:** sadece lab’da; savunma tarafında 4662, 5136, 4768/4769, 4672 gibi event mantığını öğren.
+7. **Relay hardening:** SMB signing, LDAP signing, channel binding, EPA, NTLM azaltma.
+8. **SCCM/MSSQL:** modern enterprise AD’de en çok gözden kaçan attack path’lerden biri.
+
+En güncel tehdit resmi için 2024–2026’da **AD CS + NTLM/SMB/LDAP relay-reflection + SCCM + Kerberos hygiene** dörtlüsüne ağırlık vermen en mantıklı yol.
+
+* [windowscentral.com](https://www.windowscentral.com/microsoft/windows/microsoft-plans-to-bury-its-ntlm-security-relic-after-30-years?utm_source=chatgpt.com)
+* [techradar.com](https://www.techradar.com/pro/security/cisa-warns-high-severity-windows-smb-flaw-now-exploited-in-attacks-so-update-now?utm_source=chatgpt.com)
+* [tomshardware.com](https://www.tomshardware.com/software/windows/microsofts-april-patch-puts-windows-domain-controllers-into-reboot-loops?utm_source=chatgpt.com)
+
+[1]: https://www.alteredsecurity.com/crtp-bootcamp "Attacking & Defending Active Directory: Beginner's Edition (CRTP)"
+[2]: https://www.mdpi.com/2079-9292/11/16/2629?utm_source=chatgpt.com "Active Directory Attacks—Steps, Types, and Signatures"
+[3]: https://nvd.nist.gov/vuln/detail/cve-2024-49019?utm_source=chatgpt.com "CVE-2024-49019 Detail - NVD"
+[4]: https://docs.specterops.io/ghostpack-docs/Certify.wik-mdx/esc15-ekuwu-application-policy-injection?utm_source=chatgpt.com "ESC15 - EKUwu (Application Policy Injection)"
+[5]: https://nvd.nist.gov/vuln/detail/cve-2024-49112?utm_source=chatgpt.com "CVE-2024-49112 Detail - NVD"
+[6]: https://posts.specterops.io/misconfiguration-manager-overlooked-and-overprivileged-70983b8f350d?source=rss----f05f8696e3cc---4&utm_source=chatgpt.com "Misconfiguration Manager Overlooked & Overprivileged"
+[7]: https://nvd.nist.gov/vuln/detail/CVE-2025-33073?utm_source=chatgpt.com "CVE-2025-33073 Detail - NVD"
+[8]: https://nvd.nist.gov/vuln/detail/CVE-2025-58726?utm_source=chatgpt.com "CVE-2025-58726 Detail - NVD"
+[9]: https://support.microsoft.com/en-gb/topic/kb5005413-mitigating-ntlm-relay-attacks-on-active-directory-certificate-services-ad-cs-3612b773-4043-4aa9-b23d-b87910cd3429?utm_source=chatgpt.com "KB5005413: Mitigating NTLM Relay Attacks on Active ..."
+[10]: https://learn.microsoft.com/en-us/windows-server/get-started/whats-new-windows-server-2025?utm_source=chatgpt.com "What's new in Windows Server 2025"
+[11]: https://techcommunity.microsoft.com/blog/windows-itpro-blog/advancing-windows-security-disabling-ntlm-by-default/4489526?utm_source=chatgpt.com "Advancing Windows security: Disabling NTLM by default"
+[12]: https://specterops.io/blog/2025/06/26/misconfiguration-manager-still-overlooked-still-overprivileged/?utm_source=chatgpt.com "Misconfiguration Manager: Still Overlooked ..."
