@@ -1,40 +1,36 @@
-PS 500 USER:
+Import-Module ActiveDirectory
 
-# 1. Değişken Tanımlamaları
-$OUPath = "OU=asreproasters,DC=deneme,DC=local" # Burayı kendi yapına göre değiştir
-$Password = ConvertTo-SecureString "P@ssword123!" -AsPlainText -Force
-$UserCount = 500
+# Lab parolası
+$Password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
 
-# 2. Eğer belirtilen OU yoksa oluştur
-if (-not (Get-ADOrganizationalUnit -Identity $OUPath -ErrorAction SilentlyContinue)) {
-    New-ADOrganizationalUnit -Name "LabUsers" -Path "DC=deneme,DC=local"
-    Write-Host "OU oluşturuldu: $OUPath" -ForegroundColor Cyan
+# Hedef OU
+$OU = "OU=PasswordSpray-Lab,DC=lab,DC=local"
+
+# OU yoksa oluştur
+if (-not (Get-ADOrganizationalUnit -LDAPFilter "(ou=PasswordSpray-Lab)" -ErrorAction SilentlyContinue)) {
+    New-ADOrganizationalUnit `
+        -Name "PasswordSpray-Lab" `
+        -Path "DC=lab,DC=local"
 }
 
-# 3. Kullanıcı Döngüsü
-for ($i = 1; $i -le $UserCount; $i++) {
-    $Name = "TestUser$i"
-    $SAM = "tuser$i"
-    
-    try {
-        # Kullanıcıyı oluştur
-        New-ADUser -Name $Name `
-                   -SamAccountName $SAM `
-                   -UserPrincipalName "$SAM@$(Get-ADDomain.DNSRoot)" `
-                   -Path $OUPath `
-                   -AccountPassword $Password `
-                   -Enabled $true `
-                   -ChangePasswordAtLogon $false
-        
-        # AS-REP Roasting için Kerberos Pre-Authentication özelliğini kapat
-        # 4194304 değeri 'ADS_UF_DONT_REQUIRE_PREAUTH' bayrağını temsil eder
-        Set-ADAccountControl -Identity $SAM -DoesNotRequirePreauth $true
-        
-        Write-Host "$Name oluşturuldu ve Pre-Auth devre dışı bırakıldı." -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Hata ($Name): $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
+1..500 | ForEach-Object {
+    $UserNumber = "{0:D3}" -f $_
+    $Sam        = "spray.user$UserNumber"
+    $UPN        = "$Sam@lab.local"
+    $Name       = "Spray Test User $UserNumber"
 
-Write-Host "`nİşlem tamamlandı. 50 kullanıcı AS-REP Roasting denemeleri için hazır." -ForegroundColor Yellow
+    New-ADUser `
+        -Name $Name `
+        -SamAccountName $Sam `
+        -UserPrincipalName $UPN `
+        -AccountPassword $Password `
+        -Enabled $true `
+        -Path $OU `
+        -PasswordNeverExpires $true `
+        -ChangePasswordAtLogon $false
+
+    # Kerberos pre-authentication disabled
+    Set-ADAccountControl `
+        -Identity $Sam `
+        -DoesNotRequirePreAuth $true
+}
