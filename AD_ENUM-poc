@@ -1,3 +1,12 @@
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -vulnerable \
+  -text \
+  -output esc5-check
+
+
 Tamam. Domain adıyla birlikte değerlerin şöyle olacak:
 
 ```bash
