@@ -34,3 +34,8 @@ if (-not (Get-ADOrganizationalUnit -LDAPFilter "(ou=PasswordSpray-Lab)" -ErrorAc
         -Identity $Sam `
         -DoesNotRequirePreAuth $true
 }
+
+
+Get-ADUser -Filter 'SamAccountName -like "spray.user*"' `
+    -Properties DoesNotRequirePreAuth |
+    Select-Object Name, SamAccountName, DoesNotRequirePreAuth
