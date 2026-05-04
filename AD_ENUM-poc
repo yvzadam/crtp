@@ -79,3 +79,602 @@ adidnsdump \
 ```
 
 Bu, önceki CRTP / yetkili lab rotandaki **AD enum + noisy NDR visibility** amacına uygun kalır. 
+***************************************************************************************************************************
+
+Aşağıdaki komutların hepsi **Kali makinesinden** çıkıyor. Kimlik bilgisi olarak:
+
+```bash
+domain: ndrpoc.local
+user: turing
+pass: Password3#
+dc ip: 192.168.39.143
+subnet: 192.168.39.0/24
+```
+
+Bu kullanım, senin yetkili CRTP / AD lab rotandaki **gürültülü recon-enum ve NDR görünürlük testi** amacına uyuyor. 
+
+---
+
+## 1. SMB subnet taraması
+
+```bash
+nxc smb 192.168.39.0/24 -u turing -p 'Password3#' -d ndrpoc.local
+```
+
+**Nereye gider?**
+Kali → `192.168.39.0/24` içindeki makineler.
+
+**Hangi protokol?**
+SMB, genelde TCP/445.
+
+**Ne yapar?**
+Subnet içindeki SMB açık hostları bulur ve `turing` kullanıcısıyla kimlik doğrulamayı dener.
+
+**Ne öğrenirsin?**
+
+* Hangi makinelerde SMB açık?
+* Hangi makineler domain’e bağlı?
+* Credential geçerli mi?
+* Hostname, domain bilgisi, signing durumu gibi temel bilgiler.
+
+**NDR’da nasıl görünür?**
+Tek bir hosttan çok sayıda makineye SMB bağlantısı. Bu genelde **internal reconnaissance**, **SMB scanning**, **lateral movement preparation** gibi davranışlara benzer.
+
+---
+
+## 2. SMB share enumeration
+
+```bash
+nxc smb 192.168.39.0/24 -u turing -p 'Password3#' -d ndrpoc.local --shares
+```
+
+**Nereye gider?**
+Kali → subnet içindeki SMB servisleri.
+
+**Hangi protokol?**
+SMB TCP/445.
+
+**Ne yapar?**
+Her hostta erişilebilir paylaşımları listeler.
+
+**Ne öğrenirsin?**
+
+* `ADMIN$`
+* `C$`
+* `IPC$`
+* `NETLOGON`
+* `SYSVOL`
+* Kullanıcıya açık custom share’lar.
+
+**NDR’da nasıl görünür?**
+Çok sayıda hostta share listeleme davranışı üretir. Bu, saldırganların dosya sunucusu, script, GPO, config ve credential dosyası arama öncesi yaptığı keşfe benzer.
+
+---
+
+## 3. SMB session enumeration
+
+```bash
+nxc smb 192.168.39.0/24 -u turing -p 'Password3#' -d ndrpoc.local --sessions
+```
+
+**Nereye gider?**
+Kali → subnet içindeki makineler.
+
+**Hangi protokol?**
+SMB/RPC.
+
+**Ne yapar?**
+Hedef makinelerde aktif SMB oturumlarını sorgulamaya çalışır.
+
+**Ne öğrenirsin?**
+
+* Hangi kullanıcı hangi makinede oturum açmış?
+* Admin kullanıcılar hangi sunucularda aktif olabilir?
+* Lateral movement için olası hedefler nerede?
+
+**Not:**
+Sıradan kullanıcıyla her hostta sonuç dönmeyebilir. Bazı makinelerde yetki yetersizliği görebilirsin.
+
+**NDR’da nasıl görünür?**
+Session discovery davranışı üretir. NDR tarafında “kullanıcı oturumlarını sorgulama”, “lateral movement hazırlığı” veya “AD recon” olarak değerlendirilebilir.
+
+---
+
+## 4. RID brute force
+
+```bash
+nxc smb 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --rid-brute 4000
+```
+
+**Nereye gider?**
+Kali → sadece DC: `192.168.39.143`.
+
+**Hangi protokol?**
+SMB/RPC, özellikle SAMR/LSA benzeri sorgular.
+
+**Ne yapar?**
+Domain SID bilgisinden yola çıkarak RID değerlerini dener. Örneğin:
+
+```text
+S-1-5-21-...-500
+S-1-5-21-...-501
+S-1-5-21-...-1000
+S-1-5-21-...-1001
+```
+
+Bunları kullanıcı/grup isimlerine resolve etmeye çalışır.
+
+**Ne öğrenirsin?**
+
+* Domain kullanıcıları
+* Domain grupları
+* Built-in hesaplar
+* Servis hesapları
+* Eski veya gizli kalmış hesaplar
+
+**NDR’da nasıl görünür?**
+Bu listedeki en gürültülü komutlardan biridir. DC’ye karşı yüksek hacimli SID/RID çözümleme trafiği üretir. Vectra/Darktrace tarafında **account enumeration**, **domain enumeration**, **SAMR enumeration** gibi görünebilir.
+
+---
+
+## 5. LDAP user enumeration
+
+```bash
+nxc ldap 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --users
+```
+
+**Nereye gider?**
+Kali → DC `192.168.39.143`.
+
+**Hangi protokol?**
+LDAP TCP/389.
+
+**Ne yapar?**
+Active Directory’den kullanıcı objelerini sorgular.
+
+**Ne öğrenirsin?**
+
+* Kullanıcı adları
+* Display name
+* Description alanları
+* Bazı hesap özellikleri
+* Disabled/enabled bilgileri
+* Password policy ile ilişkili bazı bilgiler
+
+**NDR’da nasıl görünür?**
+DC’ye LDAP üzerinden geniş kullanıcı sorgusu. BloodHound/SharpHound benzeri LDAP keşif trafiğinin daha küçük bir parçası gibi görünür.
+
+---
+
+## 6. LDAP group enumeration
+
+```bash
+nxc ldap 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --groups
+```
+
+**Nereye gider?**
+Kali → DC.
+
+**Hangi protokol?**
+LDAP TCP/389.
+
+**Ne yapar?**
+AD gruplarını listeler.
+
+**Ne öğrenirsin?**
+
+* Domain Admins
+* Enterprise Admins
+* Account Operators
+* Backup Operators
+* Remote Management Users
+* Custom admin grupları
+* Uygulama/SCCM/SQL grupları
+
+**NDR’da nasıl görünür?**
+AD grup yapısına yönelik LDAP sorguları. Attack path çıkarma davranışının erken aşamasıdır.
+
+---
+
+## 7. Delegation enumeration
+
+```bash
+nxc ldap 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --find-delegation
+```
+
+**Nereye gider?**
+Kali → DC.
+
+**Hangi protokol?**
+LDAP TCP/389.
+
+**Ne yapar?**
+Delegation yapılandırmalarını arar.
+
+**Ne öğrenirsin?**
+
+* Unconstrained delegation kullanan makineler
+* Constrained delegation ayarları
+* Resource-Based Constrained Delegation ile ilişkili objeler
+* Servis hesaplarının delegation durumları
+
+**NDR’da nasıl görünür?**
+LDAP üzerinden spesifik AD attribute sorguları üretir. NDR tarafında doğrudan “delegation enum” diye isimlenmeyebilir ama BloodHound tarzı AD reconnaissance davranışına benzer.
+
+---
+
+## 8. ldapdomaindump
+
+```bash
+ldapdomaindump ldap://192.168.39.143 \
+  -u 'ndrpoc.local\turing' \
+  -p 'Password3#' \
+  -o ldapdomaindump-ndrpoc
+```
+
+**Nereye gider?**
+Kali → DC.
+
+**Hangi protokol?**
+LDAP TCP/389.
+
+**Ne yapar?**
+Domain’den geniş bir LDAP snapshot alır.
+
+**Ne öğrenirsin?**
+
+* Kullanıcılar
+* Gruplar
+* Bilgisayarlar
+* Grup üyelikleri
+* Policy bilgileri
+* Trust/domain bilgileri
+* Admin hesaplar
+* ServicePrincipalName bilgileri
+
+**Çıktı nereye gider?**
+Kali üzerinde şu klasöre yazar:
+
+```text
+ldapdomaindump-ndrpoc/
+```
+
+Genellikle HTML, JSON ve grep edilebilir dosyalar üretir.
+
+**NDR’da nasıl görünür?**
+DC’ye karşı yoğun LDAP sorgusu. NDR için çok iyi bir “AD enumeration burst” sinyali üretir.
+
+---
+
+## 9. BloodHound.py full collection
+
+```bash
+bloodhound-python \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local \
+  -ns 192.168.39.143 \
+  -dc 192.168.39.143 \
+  -c All \
+  --zip \
+  -op bh-ndrpoc-all
+```
+
+**Nereye gider?**
+Kali → DC ve bazı durumlarda domain makineleri.
+
+**Hangi protokoller?**
+
+* LDAP TCP/389
+* DNS TCP/UDP 53
+* SMB TCP/445
+* Kerberos TCP/UDP 88
+
+**Ne yapar?**
+BloodHound için attack path verisi toplar.
+
+**`-c All` ne demek?**
+Toplanabilecek bütün collection method’larını çalıştırmaya çalışır.
+
+**Ne öğrenirsin?**
+
+* Kullanıcılar
+* Gruplar
+* Bilgisayarlar
+* Oturumlar
+* Local admin ilişkileri
+* ACL ilişkileri
+* GPO ilişkileri
+* Delegation ilişkileri
+* Trust ilişkileri
+* RDP/WinRM/DCOM gibi erişim edge’leri
+
+**Çıktı nereye gider?**
+Kali’de şu isimle zip/json üretir:
+
+```text
+bh-ndrpoc-all*.zip
+```
+
+Bunu BloodHound GUI’ye import edersin.
+
+**NDR’da nasıl görünür?**
+Bu da en gürültülü komutlardan biridir. Tek bir hosttan DC’ye yoğun LDAP sorgusu ve bazı hostlara SMB bağlantıları üretir. NDR tarafında **BloodHound-like activity**, **AD graph enumeration**, **privilege escalation path discovery** gibi davranışlara benzer.
+
+---
+
+## 10. Certipy AD CS enumeration
+
+```bash
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -text \
+  -json \
+  -bloodhound \
+  -output certipy-ndrpoc-full
+```
+
+**Nereye gider?**
+Kali → DC ve varsa CA/AD CS objeleri.
+
+**Hangi protokoller?**
+
+* LDAP TCP/389
+* DNS 53
+* Bazı durumlarda RPC/SMB/HTTP tabanlı CA sorguları
+
+**Ne yapar?**
+AD CS ortamını enum eder.
+
+**Ne öğrenirsin?**
+
+* CA var mı?
+* Certificate template’ler neler?
+* Kimler enroll edebilir?
+* Template izinleri nasıl?
+* ESC1, ESC2, ESC3 gibi AD CS misconfiguration ihtimalleri var mı?
+* BloodHound’a import edilebilecek AD CS ilişkileri var mı?
+
+**Çıktı nereye gider?**
+
+```text
+certipy-ndrpoc-full.txt
+certipy-ndrpoc-full.json
+certipy-ndrpoc-full_Certipy.zip
+```
+
+Dosya isimleri sürüme göre biraz değişebilir.
+
+**NDR’da nasıl görünür?**
+AD CS keşif trafiği üretir. Eğer ortamda CA varsa DC/CA etrafında certificate template ve enrollment service sorguları gözlenebilir.
+
+---
+
+## 11. GetADUsers.py
+
+```bash
+GetADUsers.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -all
+```
+
+**Nereye gider?**
+Kali → DC.
+
+**Hangi protokol?**
+LDAP TCP/389.
+
+**Ne yapar?**
+Impacket ile domain kullanıcılarını listeler.
+
+**Ne öğrenirsin?**
+
+* Kullanıcı adları
+* Hesap açıklamaları
+* Son logon bilgileri
+* Password last set bilgileri
+* Hesap durumları
+
+**NDR’da nasıl görünür?**
+LDAP user enumeration. NetExec `--users` ve ldapdomaindump’a benzer ama Impacket imzasıyla çıkar.
+
+---
+
+## 12. GetUserSPNs.py -request
+
+```bash
+GetUserSPNs.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -request
+```
+
+**Nereye gider?**
+Kali → DC/KDC.
+
+**Hangi protokoller?**
+
+* LDAP TCP/389
+* Kerberos TCP/UDP 88
+
+**Ne yapar?**
+SPN’e sahip servis hesaplarını bulur ve `-request` ile bu servisler için TGS ister.
+
+**Ne öğrenirsin?**
+
+* Hangi hesaplarda SPN var?
+* MSSQL, HTTP, CIFS, MSSQLSvc gibi servis hesapları var mı?
+* Kerberoasting’e açık servis hesabı yüzeyi var mı?
+
+**Önemli:**
+Bu komut TGS ticket talebi üretir. Parola kırma yapmaz ama Kerberoasting tespit kuralları açısından önemli sinyal oluşturabilir.
+
+**NDR’da nasıl görünür?**
+Kısa sürede bir kullanıcıdan birden fazla SPN için Kerberos TGS request oluşur. Bu, **Kerberoasting behavior**, **unusual Kerberos service ticket requests** veya **service account discovery** olarak yakalanabilir.
+
+---
+
+## 13. GetNPUsers.py -request
+
+```bash
+GetNPUsers.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -request
+```
+
+**Nereye gider?**
+Kali → DC/KDC.
+
+**Hangi protokoller?**
+
+* LDAP TCP/389
+* Kerberos TCP/UDP 88
+
+**Ne yapar?**
+Kerberos pre-authentication gerektirmeyen kullanıcıları arar ve varsa AS-REP yanıtı ister.
+
+**Ne öğrenirsin?**
+
+* `Do not require Kerberos preauthentication` ayarlı hesap var mı?
+* AS-REP roast yüzeyi var mı?
+
+**Önemli:**
+Bu da parola kırmaz. Sadece AS-REP alınabilir mi diye bakar.
+
+**NDR’da nasıl görünür?**
+Kerberos AS-REQ/AS-REP davranışı üretir. Pre-auth olmayan hesaplara yönelik sorgular, **AS-REP roasting attempt** olarak görülebilir.
+
+---
+
+## 14. findDelegation.py
+
+```bash
+findDelegation.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143
+```
+
+**Nereye gider?**
+Kali → DC.
+
+**Hangi protokol?**
+LDAP TCP/389.
+
+**Ne yapar?**
+Delegation yapılandırmalarını Impacket ile sorgular.
+
+**Ne öğrenirsin?**
+
+* Unconstrained delegation
+* Constrained delegation
+* Protocol transition kullanılan hesaplar
+* Servis hesaplarının delegation ayarları
+
+**NDR’da nasıl görünür?**
+LDAP attribute discovery. NetExec `--find-delegation` ile benzer amaca hizmet eder ama farklı tool fingerprint’i üretir.
+
+---
+
+## 15. adidnsdump
+
+Senin yapıştırdığın satırın sonunda küçük bir birleşme hatası var:
+
+```bash
+-o adidnsdump-ndrpocHER
+```
+
+Buradaki `HER` komuta ait değil. Doğrusu şöyle olmalı:
+
+```bash
+adidnsdump \
+  -u 'ndrpoc.local\turing' \
+  -p 'Password3#' \
+  --dns-tcp \
+  --print-zones \
+  ldap://192.168.39.143 \
+  -r \
+  -o adidnsdump-ndrpoc
+```
+
+**Nereye gider?**
+Kali → DC/DNS sunucusu `192.168.39.143`.
+
+**Hangi protokoller?**
+
+* LDAP TCP/389
+* DNS TCP/53, çünkü `--dns-tcp` var
+
+**Ne yapar?**
+AD-integrated DNS zone kayıtlarını enum eder.
+
+**Ne öğrenirsin?**
+
+* DC kayıtları
+* Workstation kayıtları
+* Server kayıtları
+* SQL, SCCM, CA, ADFS, WSUS gibi servis hostları
+* Eski veya unutulmuş DNS kayıtları
+* Internal hostname bilgileri
+
+**`-r` ne yapar?**
+Bulduğu DNS kayıtlarını resolve etmeye çalışır. Bu da ekstra DNS sorgusu üretir.
+
+**`--print-zones` ne yapar?**
+Erişilebilen AD DNS zone’larını yazdırır.
+
+**Çıktı nereye gider?**
+
+```text
+adidnsdump-ndrpoc/
+```
+
+veya tool sürümüne göre dosya prefix’i olarak kullanılır.
+
+**NDR’da nasıl görünür?**
+DC/DNS’e karşı çok sayıda internal DNS sorgusu ve LDAP zone enumeration trafiği üretir. NDR tarafında **DNS enumeration**, **internal asset discovery**, **ADIDNS reconnaissance** gibi davranışlara benzer.
+
+---
+
+# Genel trafik özeti
+
+| Komut grubu                |        Hedef | Port/Protokol         | Gürültü seviyesi |
+| -------------------------- | -----------: | --------------------- | ---------------- |
+| `nxc smb 192.168.39.0/24`  |   Tüm subnet | SMB 445               | Yüksek           |
+| `--shares`                 |   Tüm subnet | SMB 445               | Yüksek           |
+| `--sessions`               |   Tüm subnet | SMB/RPC               | Yüksek           |
+| `--rid-brute 4000`         |           DC | SMB/RPC/SAMR          | Çok yüksek       |
+| `nxc ldap --users/groups`  |           DC | LDAP 389              | Orta-yüksek      |
+| `ldapdomaindump`           |           DC | LDAP 389              | Yüksek           |
+| `bloodhound-python -c All` | DC + hostlar | LDAP/SMB/DNS/Kerberos | Çok yüksek       |
+| `certipy find`             |        DC/CA | LDAP/RPC/HTTP olası   | Orta-yüksek      |
+| `GetUserSPNs -request`     |       DC/KDC | LDAP + Kerberos 88    | Yüksek           |
+| `GetNPUsers -request`      |       DC/KDC | LDAP + Kerberos 88    | Yüksek           |
+| `adidnsdump -r`            |       DC/DNS | LDAP + DNS 53         | Yüksek           |
+
+---
+
+# NDR tarafında özellikle bakacağın davranışlar
+
+```text
+Kali_IP -> 192.168.39.0/24 SMB sweep
+Kali_IP -> 192.168.39.143 LDAP query burst
+Kali_IP -> 192.168.39.143 SAMR/RID enumeration
+Kali_IP -> 192.168.39.143 Kerberos TGS request burst
+Kali_IP -> 192.168.39.143 AS-REP request behavior
+Kali_IP -> 192.168.39.143 AD CS template enumeration
+Kali_IP -> 192.168.39.143 DNS SRV / ADIDNS enumeration
+Single non-admin user performing broad domain reconnaissance
+BloodHound-like LDAP collection pattern
+```
+
+Windows log tarafında da DC üzerinde özellikle şunlar anlamlı olabilir:
+
+```text
+4624 - Network logon
+4768 - Kerberos TGT request
+4769 - Kerberos service ticket request
+4771 - Kerberos pre-auth failure, varsa
+4662 - Directory object access, auditing açıksa
+5140 - Network share object accessed
+```
+
+Bu komut setinin en belirgin üç alarm üreticisi muhtemelen şunlar olur:
+
+```bash
+nxc smb 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --rid-brute 4000
+bloodhound-python -u turing -p 'Password3#' -d ndrpoc.local -ns 192.168.39.143 -dc 192.168.39.143 -c All --zip -op bh-ndrpoc-all
+GetUserSPNs.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -request
+```
