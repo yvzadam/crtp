@@ -1,0 +1,19 @@
+mkdir -p ~/bhce-compose
+cd ~/bhce-compose
+
+curl -L \
+  https://raw.githubusercontent.com/SpecterOps/BloodHound/main/examples/docker-compose/docker-compose.yml \
+  -o docker-compose.yml
+
+curl -L \
+  https://raw.githubusercontent.com/SpecterOps/BloodHound/main/examples/docker-compose/bloodhound.config.json \
+  -o bloodhound.config.json
+
+docker compose up -d
+
+
+
+docker compose logs bloodhound | grep -i "Initial Password"
+
+
+xdg-open http://127.0.0.1:8080/ui/login
